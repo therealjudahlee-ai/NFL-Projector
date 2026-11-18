@@ -143,7 +143,7 @@ def build_nfl_context():
     out_players = set()
     active_roster_team = {}
 
-    # Load live current-week rosters & block any player on IR / PUP / NFI / SUS
+    # 1. Load nflreadpy weekly rosters & block IR / PUP / NFI / SUS
     try:
         rost_df = nfl.load_rosters_weekly([current_season]).to_pandas()
         if not rost_df.empty:
@@ -161,7 +161,7 @@ def build_nfl_context():
     except Exception:
         pass
 
-    # Load weekly NFL injury reports (Out / Doubtful)
+    # 2. Load nflreadpy weekly injury report
     team_pos_bump = {}
     try:
         inj_df = nfl.load_injuries([current_season]).to_pandas()
@@ -186,7 +186,8 @@ def build_nfl_context():
     except Exception:
         pass
 
-    # Pull live ESPN NFL injury/IR feed (catches mid-week IR placements immediately)
+    # 3. Pull LIVE ESPN NFL injuries & 32-team active rosters (catches IR like Malik Willis immediately)
+    espn_abbr_map = {"WSH": "WAS", "LAR": "LA"}
     try:
         espn_inj = requests.get(
             "https://site.api.espn.com/apis/site/v2/sports/football/nfl/injuries", timeout=8
@@ -194,11 +195,42 @@ def build_nfl_context():
         for team_blk in espn_inj.get("injuries", []):
             for item in team_blk.get("injuries", []):
                 st_txt = str(item.get("status", "")).lower()
-                if any(k in st_txt for k in ["out", "doubtful", "injured reserve", "ir", "pup", "suspension"]):
+                type_desc = str(item.get("type", {}).get("description", "")).lower()
+                if any(k in st_txt or k in type_desc for k in ["out", "doubtful", "injured reserve", "ir", "pup", "suspension"]):
                     ath = item.get("athlete", {})
                     nm_norm = _norm_name(ath.get("displayName", ""))
                     if nm_norm:
                         out_players.add(nm_norm)
+    except Exception:
+        pass
+
+    try:
+        teams_resp = requests.get(
+            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams?limit=40", timeout=8
+        ).json()
+        for sp in teams_resp.get("sports", []):
+            for lg in sp.get("leagues", []):
+                for t_obj in lg.get("teams", []):
+                    t_info = t_obj.get("team", {})
+                    t_id = t_info.get("id")
+                    t_abbr = espn_abbr_map.get(t_info.get("abbreviation", ""), t_info.get("abbreviation", ""))
+                    if not t_id:
+                        continue
+                    r_resp = requests.get(
+                        f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{t_id}/roster",
+                        timeout=6,
+                    ).json()
+                    for grp in r_resp.get("athletes", []):
+                        for ath in grp.get("items", []):
+                            nm_norm = _norm_name(ath.get("displayName", ""))
+                            if not nm_norm:
+                                continue
+                            st_type = str(ath.get("status", {}).get("type", "active")).lower()
+                            if st_type != "active":
+                                out_players.add(nm_norm)
+                                active_roster_team.pop(nm_norm, None)
+                            else:
+                                active_roster_team[nm_norm] = t_abbr
     except Exception:
         pass
 
@@ -448,7 +480,7 @@ def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manua
 #             ADVANCED NFL DFS POOL & MULTI-LINEUP SOLVER
 # =====================================================================
 def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
-    """Builds a projected NFL DFS player pool with IR/Injury filtering & 1-QB-per-team enforcement."""
+    """Builds a projected NFL DFS player pool with live ESPN IR/Roster filtering & 1-QB-per-team."""
     reg_stats = nfl_ctx["reg_stats"]
     team_col = nfl_ctx["team_col"]
     matchup_map = nfl_ctx["matchup_map"]
@@ -500,12 +532,12 @@ def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
         if len(p_logs) < 3:
             continue
 
-        # Require starter-level passing volume (20+ pass att/game) AND activity within last 2 weeks
+        # Require starter-level passing volume (20+ pass att/game) AND activity last week
         if pos == "QB":
             recent_att = p_logs["attempts"].tail(4).mean() if "attempts" in p_logs.columns else 0
             szn_logs = p_logs[p_logs["season"] == nfl_ctx["season"]]
             last_wk = int(szn_logs["week"].max()) if not szn_logs.empty else 0
-            if recent_att < 20.0 or last_wk < (nfl_ctx["week"] - 2):
+            if recent_att < 20.0 or last_wk < (nfl_ctx["week"] - 1):
                 continue
         else:
             if p_logs[stat_col].tail(6).mean() < 5.5:
