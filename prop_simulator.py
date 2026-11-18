@@ -1,6 +1,7 @@
 from datetime import datetime
 import itertools
 import os
+import re
 import subprocess
 import sys
 import time
@@ -12,6 +13,15 @@ import requests
 from scipy.optimize import Bounds, LinearConstraint, milp
 
 N_SIMS = 1_000_000  # 1 Million Monte Carlo simulations per projection
+
+
+def _norm_name(name):
+    """Normalizes player names so 'C.J. Stroud' matches 'CJ Stroud'."""
+    s = re.sub(r"[^a-z0-9\s]", "", str(name).lower()).strip()
+    for suffix in [" jr", " sr", " ii", " iii", " iv"]:
+        if s.endswith(suffix):
+            s = s[: -len(suffix)].strip()
+    return s
 
 
 # =====================================================================
@@ -126,7 +136,7 @@ def build_nfl_context():
                     (dc_df[pos_col] == "QB")
                     & (pd.to_numeric(dc_df[rank_col], errors="coerce") == 1)
                 ]
-                starting_qbs = {str(x).strip().lower() for x in qb1[name_dc].dropna()}
+                starting_qbs = {_norm_name(x) for x in qb1[name_dc].dropna() if _norm_name(x)}
     except Exception:
         pass
 
@@ -140,7 +150,7 @@ def build_nfl_context():
                 rost_df = rost_df[rost_df["status"].isin(["ACT", "Active"])]
             r_name = "full_name" if "full_name" in rost_df.columns else "player_name"
             for _, r in rost_df.iterrows():
-                nm = str(r.get(r_name, "")).strip().lower()
+                nm = _norm_name(r.get(r_name, ""))
                 if nm:
                     active_roster_team[nm] = str(r.get("team", "")).strip()
     except Exception:
@@ -156,13 +166,13 @@ def build_nfl_context():
             bad = wk_inj[wk_inj["report_status"].isin(["Out", "Doubtful"])]
             name_c = "full_name" if "full_name" in bad.columns else "player_name"
             for _, r in bad.iterrows():
-                p_name = str(r.get(name_c, "")).strip().lower()
+                p_name = _norm_name(r.get(name_c, ""))
                 if p_name:
                     out_players.add(p_name)
                 t_abbr = str(r.get("team", "")).strip()
                 pos_str = str(r.get("position", "")).strip()
                 hist = reg_stats[
-                    (reg_stats["player_display_name"].str.lower() == p_name)
+                    (reg_stats["player_display_name"].apply(_norm_name) == p_name)
                     & (reg_stats["season"] == current_season)
                 ]
                 if not hist.empty and hist["dk_points"].mean() >= 10.0:
@@ -418,7 +428,7 @@ def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manua
 #             ADVANCED NFL DFS POOL & MULTI-LINEUP SOLVER
 # =====================================================================
 def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
-    """Builds a projected NFL DFS player pool verified against live depth charts & active rosters."""
+    """Builds a projected NFL DFS player pool with strict 1-starting-QB-per-team enforcement."""
     reg_stats = nfl_ctx["reg_stats"]
     team_col = nfl_ctx["team_col"]
     matchup_map = nfl_ctx["matchup_map"]
@@ -433,11 +443,12 @@ def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
         for _, row in custom_csv_df.iterrows():
             nm = str(row.get("Name", row.get("Nickname", ""))).strip()
             if nm:
-                csv_salaries[nm.lower()] = int(pd.to_numeric(row.get("Salary", 5000), errors="coerce") or 5000)
+                norm_nm = _norm_name(nm)
+                csv_salaries[norm_nm] = int(pd.to_numeric(row.get("Salary", 5000), errors="coerce") or 5000)
                 if "Name + ID" in row:
-                    csv_ids[nm.lower()] = str(row["Name + ID"])
+                    csv_ids[norm_nm] = str(row["Name + ID"])
                 elif "Id" in row:
-                    csv_ids[nm.lower()] = f"{nm} ({row['Id']})"
+                    csv_ids[norm_nm] = f"{nm} ({row['Id']})"
 
     recent_pool = reg_stats[
         (reg_stats["season"] == nfl_ctx["season"]) & (reg_stats["week"] >= max(1, nfl_ctx["week"] - 4))
@@ -449,15 +460,15 @@ def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
     pool = []
     for _, p in active_players.iterrows():
         p_name_raw = str(p["player_display_name"]).strip()
-        p_name_low = p_name_raw.lower()
-        if p_name_low in out_players:
+        p_norm = _norm_name(p_name_raw)
+        if p_norm in out_players:
             continue
 
         # Sync to live active roster team if available
         if active_roster_team:
-            if p_name_low not in active_roster_team:
+            if p_norm not in active_roster_team:
                 continue
-            team = active_roster_team[p_name_low]
+            team = active_roster_team[p_norm]
         else:
             team = p[team_col]
 
@@ -469,11 +480,10 @@ def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
         if len(p_logs) < 3:
             continue
 
-        # Strictly block backup / non-starting QBs from the DFS pool
+        # Require starter-level passing volume (20+ pass attempts/game) for QBs
         if pos == "QB":
             recent_att = p_logs["attempts"].tail(4).mean() if "attempts" in p_logs.columns else 0
-            is_qb1 = (not starting_qbs) or (p_name_low in starting_qbs)
-            if recent_att < 16.0 or not is_qb1:
+            if recent_att < 20.0:
                 continue
         else:
             if p_logs[stat_col].tail(6).mean() < 5.5:
@@ -481,13 +491,12 @@ def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
 
         opp = matchup_map[team]["opponent"]
         res = simulate_nfl_prop(nfl_ctx, p_logs, opp, stat_col, 15.0, override_team=team)
-        name_lower = res["player"].lower()
 
-        if csv_salaries and name_lower not in csv_salaries:
+        if csv_salaries and p_norm not in csv_salaries:
             continue
 
-        if name_lower in csv_salaries:
-            salary = csv_salaries[name_lower]
+        if p_norm in csv_salaries:
+            salary = csv_salaries[p_norm]
         else:
             if site == "DK":
                 base_sal = {
@@ -514,7 +523,7 @@ def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
         pool.append(
             {
                 "name": res["player"],
-                "dk_id": csv_ids.get(name_lower, res["player"]),
+                "dk_id": csv_ids.get(p_norm, res["player"]),
                 "pos": pos,
                 "team": team,
                 "opp": opp,
@@ -526,8 +535,21 @@ def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
                 "leverage": round(leverage_pts, 2),
                 "value": round(val, 2),
                 "flags": res["flags"],
+                "_is_dc_qb1": 1 if (pos == "QB" and p_norm in starting_qbs) else 0,
             }
         )
+
+    # Strictly keep ONLY 1 true starting QB per NFL team (eliminates backups like Davis Mills)
+    df_temp = pd.DataFrame(pool)
+    if not df_temp.empty and "QB" in df_temp["pos"].values:
+        qbs = df_temp[df_temp["pos"] == "QB"].sort_values(["_is_dc_qb1", "proj"], ascending=[False, False])
+        qbs = qbs.drop_duplicates(subset=["team"], keep="first")
+        non_qbs = df_temp[df_temp["pos"] != "QB"]
+        df_temp = pd.concat([qbs, non_qbs], ignore_index=True)
+
+    if not df_temp.empty and "_is_dc_qb1" in df_temp.columns:
+        df_temp = df_temp.drop(columns=["_is_dc_qb1"])
+    pool = df_temp.to_dict("records") if not df_temp.empty else []
 
     for team, info in matchup_map.items():
         opp = info["opponent"]
@@ -535,12 +557,14 @@ def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
         dst_proj = float(np.clip(13.5 - (opp_implied * 0.32), 3.0, 12.0))
         dst_ceil = dst_proj + 5.5
         dst_name = f"{team} DST"
-        if csv_salaries and dst_name.lower() not in csv_salaries and team.lower() not in csv_salaries:
+        dst_norm = _norm_name(dst_name)
+        t_norm = _norm_name(team)
+        if csv_salaries and dst_norm not in csv_salaries and t_norm not in csv_salaries:
             continue
         sal = csv_salaries.get(
-            dst_name.lower(),
+            dst_norm,
             csv_salaries.get(
-                team.lower(),
+                t_norm,
                 int(np.clip(round(((2200 if site == "DK" else 3200) + dst_proj * 210) / 100) * 100, 2200, 5200)),
             ),
         )
@@ -549,7 +573,7 @@ def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
         pool.append(
             {
                 "name": dst_name,
-                "dk_id": csv_ids.get(dst_name.lower(), dst_name),
+                "dk_id": csv_ids.get(dst_norm, dst_name),
                 "pos": "DST",
                 "team": team,
                 "opp": opp,
@@ -584,8 +608,8 @@ def optimize_nfl_dfs_lineups(
     if df_pool.empty:
         return []
 
-    locked_names = {x.lower() for x in (locked_names or [])}
-    excluded_names = {x.lower() for x in (excluded_names or [])}
+    locked_names = {_norm_name(x) for x in (locked_names or [])}
+    excluded_names = {_norm_name(x) for x in (excluded_names or [])}
 
     salary_cap = 50000 if site == "DK" else 60000
     score_col = {"cash": "proj", "gpp": "ceiling", "leverage": "leverage"}[mode]
@@ -604,7 +628,7 @@ def optimize_nfl_dfs_lineups(
     lb = np.zeros(n)
     ub = np.ones(n)
     for idx, row in df_pool.iterrows():
-        nm = row["name"].lower()
+        nm = _norm_name(row["name"])
         if nm in excluded_names:
             ub[idx] = 0.0
         elif nm in locked_names:
@@ -1036,7 +1060,7 @@ def build_nba_dfs_pool(nba_ctx, custom_csv_df=None):
         for _, row in custom_csv_df.iterrows():
             nm = str(row.get("Name", "")).strip()
             if nm:
-                csv_salaries[nm.lower()] = int(pd.to_numeric(row.get("Salary", 5000), errors="coerce") or 5000)
+                csv_salaries[_norm_name(nm)] = int(pd.to_numeric(row.get("Salary", 5000), errors="coerce") or 5000)
 
     cutoff = nba_df["GAME_DATE"].max() - pd.Timedelta(days=14)
     active_ids = nba_df[nba_df["GAME_DATE"] >= cutoff]["PLAYER_ID"].unique()
@@ -1052,11 +1076,11 @@ def build_nba_dfs_pool(nba_ctx, custom_csv_df=None):
             continue
 
         res = simulate_nba_prop(nba_ctx, p_logs, matchup_map[t]["opponent"], "DK_PTS", 25.0)
-        nm_lower = res["player"].lower()
-        if csv_salaries and nm_lower not in csv_salaries:
+        nm_norm = _norm_name(res["player"])
+        if csv_salaries and nm_norm not in csv_salaries:
             continue
 
-        sal = csv_salaries.get(nm_lower, int(np.clip(round((3000 + res["proj"] * 175) / 100) * 100, 3000, 11800)))
+        sal = csv_salaries.get(nm_norm, int(np.clip(round((3000 + res["proj"] * 175) / 100) * 100, 3000, 11800)))
         val = (res["proj"] / sal) * 1000.0
         est_own = float(np.clip((val - 4.2) * 9.0, 2.0, 42.0))
         pool.append({
@@ -1079,8 +1103,8 @@ def optimize_nba_dfs_lineups(df_pool, mode="gpp", num_lineups=1, min_unique=2, m
     """Solves 1 to 20 optimal 8-player NBA DFS lineups under $50,000."""
     if df_pool.empty:
         return []
-    locked_names = {x.lower() for x in (locked_names or [])}
-    excluded_names = {x.lower() for x in (excluded_names or [])}
+    locked_names = {_norm_name(x) for x in (locked_names or [])}
+    excluded_names = {_norm_name(x) for x in (excluded_names or [])}
     score_col = {"cash": "proj", "gpp": "ceiling", "leverage": "leverage"}[mode]
 
     n = len(df_pool)
@@ -1094,7 +1118,7 @@ def optimize_nba_dfs_lineups(df_pool, mode="gpp", num_lineups=1, min_unique=2, m
 
     lb, ub = np.zeros(n), np.ones(n)
     for i, r in df_pool.iterrows():
-        nm = r["name"].lower()
+        nm = _norm_name(r["name"])
         if nm in excluded_names:
             ub[i] = 0.0
         elif nm in locked_names:
@@ -1268,7 +1292,7 @@ def run_nfl_menu(nfl_ctx=None):
 
             qualifying_legs = []
             for _, p in active_players.iterrows():
-                if str(p["player_display_name"]).strip().lower() in out_players:
+                if _norm_name(p["player_display_name"]) in out_players:
                     continue
                 team, pos = p[team_col], p["position"]
                 if team not in matchup_map or pos not in pos_props:
