@@ -12,6 +12,12 @@ N_SIMS = 1_000_000  # 1 Million Monte Carlo simulations per projection
 #                   RECENCY-WEIGHTED 100 / 500 REPORT
 # =====================================================================
 def generate_100_500_report(df_2yr, sort_cols, target_col, threshold, entity_mask=None):
+    if df_2yr is None or df_2yr.empty:
+        return {
+            100: {"n": 0, "raw_rate": 0.0, "weighted_rate": 0.0, "hits": 0},
+            500: {"n": 0, "raw_rate": 0.0, "weighted_rate": 0.0, "hits": 0},
+        }
+
     sub = df_2yr[entity_mask].copy() if entity_mask is not None else df_2yr.copy()
     sub = sub.sort_values(sort_cols).dropna(subset=[target_col])
 
@@ -147,7 +153,6 @@ def build_ncaab_context(target_date_str=None):
             label = f"{away_name} ({away}) @ {home_name} ({home})"
             todays_games.append(label)
 
-            # Extract Vegas spread & total if posted (Negative = Home Favored)
             vegas_spread, vegas_total = np.nan, np.nan
             odds_list = comp.get("odds", [])
             if odds_list:
@@ -164,7 +169,6 @@ def build_ncaab_context(target_date_str=None):
             game_pace = (team_pace.get(home, league_pace) + team_pace.get(away, league_pace)) / 2.0
             pace_ratio = game_pace / league_pace
 
-            # Pace-adjusted Computer Projected Team Scores (+3.2 D1 Home Court Edge)
             comp_home = ((team_off.get(home, 74.0) + team_def.get(away, 74.0)) / 2.0) * (0.5 + 0.5 * pace_ratio) + 1.6
             comp_away = ((team_off.get(away, 74.0) + team_def.get(home, 74.0)) / 2.0) * (0.5 + 0.5 * pace_ratio) - 1.6
             comp_total = comp_home + comp_away
@@ -215,7 +219,6 @@ def build_ncaab_context(target_date_str=None):
     except Exception as e:
         print(f"[!] Warning fetching ESPN NCAAB scoreboard: {e}")
 
-    # Recency-weighted defensive lookup by stat
     def_lookup = {}
     for stat in ["PTS", "REB", "AST", "FG3M", "PRA", "PR", "PA", "RA"]:
         g_tot = mbb_df.groupby(["OPP_ABBR", "game_id", "GAME_DATE"])[stat].sum().reset_index().sort_values("GAME_DATE")
@@ -244,7 +247,7 @@ def simulate_ncaab_game(game, custom_spread=None, custom_total=None):
     """Simulates a Men's College Basketball game 1,000,000 times for Spread & Total."""
     proj_home = game["proj_home"]
     proj_away = game["proj_away"]
-    comp_spread = -(proj_home - proj_away)  # Negative = Home favored
+    comp_spread = -(proj_home - proj_away)
     comp_total = game["comp_total"]
 
     spread_line = custom_spread if custom_spread is not None else (
@@ -650,7 +653,6 @@ def run_ncaab_menu(ctx=None):
             val_plays = []
             for g in game_list:
                 base_res = simulate_ncaab_game(g)
-                # Push spread by 6.5 and 10.5 points in the model's favored direction for 2x-3x payout
                 for push in [6.5, 10.5]:
                     alt_sp = (
                         base_res["spread_line"] - push
@@ -665,7 +667,6 @@ def run_ncaab_menu(ctx=None):
             val_plays.sort(key=lambda x: x["best_side_prob"] * (1.0 + 0.05 * x["spread_edge"]), reverse=True)
             print(f"\nCompleted {len(game_list) * 2 * N_SIMS:,} CBB alt-spread sims in {elapsed:.1f}s!")
 
-            # 2-Year Historical D1 Margin Cover Report (Last 100 & Last 500 D1 games)
             team_agg["ABS_MARGIN"] = team_agg["MARGIN"].abs()
             unique_games = team_agg.drop_duplicates(subset=["game_id"]).sort_values("GAME_DATE")
             rep = generate_100_500_report(unique_games, ["GAME_DATE"], "ABS_MARGIN", 12.0)
@@ -707,54 +708,83 @@ def build_ncaaf_context():
     curr_szn = now.year if now.month >= 8 else now.year - 1
     seasons = [curr_szn - 1, curr_szn]
 
-    sched_dfs, box_dfs = [], []
+    completed_rows = []
+    # Pull completed FBS games across the last 2 seasons directly from ESPN's open FBS scoreboard API
     for szn in seasons:
+        url = (
+            f"https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard"
+            f"?groups=80&limit=900&dates={szn}0820-{szn + 1}0125"
+        )
         try:
-            s_url = f"https://github.com/sportsdataverse/sportsdataverse-data/releases/download/espn_cfb_schedules/cfb_schedules_{szn}.parquet"
-            sched_dfs.append(pd.read_parquet(s_url))
-        except Exception as e:
-            print(f"[!] Warning loading CFB {szn} schedule: {e}")
-        try:
-            b_url = f"https://github.com/sportsdataverse/sportsdataverse-data/releases/download/espn_cfb_team_boxscores/team_box_{szn}.parquet"
-            box_dfs.append(pd.read_parquet(b_url))
-        except Exception:
-            pass
+            resp = requests.get(url, timeout=15).json()
+            for ev in resp.get("events", []):
+                comp = ev["competitions"][0]
+                if not comp["status"]["type"]["completed"]:
+                    continue
+                competitors = comp["competitors"]
+                home_c = next(c for c in competitors if c["homeAway"] == "home")
+                away_c = next(c for c in competitors if c["homeAway"] == "away")
 
-    sched_df = pd.concat(sched_dfs, ignore_index=True)
-    sched_df["game_date"] = pd.to_datetime(sched_df["start_date"], errors="coerce")
-    completed = sched_df.dropna(subset=["home_points", "away_points"]).sort_values("game_date")
+                h_pts = pd.to_numeric(home_c.get("score"), errors="coerce")
+                a_pts = pd.to_numeric(away_c.get("score"), errors="coerce")
+                if pd.isna(h_pts) or pd.isna(a_pts):
+                    continue
+
+                def get_stat(comp_obj, stat_name):
+                    for s in comp_obj.get("statistics", []):
+                        if s.get("name") == stat_name:
+                            return pd.to_numeric(s.get("displayValue"), errors="coerce")
+                    return np.nan
+
+                completed_rows.append(
+                    {
+                        "game_date": pd.to_datetime(ev.get("date", "")[:10], errors="coerce"),
+                        "home_team": home_c["team"]["shortDisplayName"],
+                        "away_team": away_c["team"]["shortDisplayName"],
+                        "home_points": float(h_pts),
+                        "away_points": float(a_pts),
+                        "home_ypp": get_stat(home_c, "yardsPerPlay"),
+                        "away_ypp": get_stat(away_c, "yardsPerPlay"),
+                        "home_tov": get_stat(home_c, "turnovers"),
+                        "away_tov": get_stat(away_c, "turnovers"),
+                    }
+                )
+        except Exception as e:
+            print(f"[!] Warning loading CFB {szn} games from ESPN: {e}")
+
+    completed = pd.DataFrame(completed_rows)
+    if not completed.empty:
+        completed = completed.sort_values("game_date").reset_index(drop=True)
 
     team_stats = {}
-    all_teams = set(completed["home_team"].dropna()).union(set(completed["away_team"].dropna()))
+    if not completed.empty:
+        all_teams = set(completed["home_team"].dropna()).union(set(completed["away_team"].dropna()))
+        for t in all_teams:
+            g = completed[(completed["home_team"] == t) | (completed["away_team"] == t)].tail(16)
+            if g.empty:
+                continue
+            scored = np.where(g["home_team"] == t, g["home_points"], g["away_points"]).astype(float)
+            allowed = np.where(g["home_team"] == t, g["away_points"], g["home_points"]).astype(float)
+            ypp_vals = np.where(g["home_team"] == t, g["home_ypp"], g["away_ypp"]).astype(float)
+            tov_vals = np.where(g["home_team"] == t, g["home_tov"], g["away_tov"]).astype(float)
 
-    ypp_map, to_map = {}, {}
-    if box_dfs:
-        box_df = pd.concat(box_dfs, ignore_index=True)
-        if "yards_per_play" in box_df.columns and "team_short_display_name" in box_df.columns:
-            for t, grp in box_df.groupby("team_short_display_name"):
-                ypp_map[t] = float(pd.to_numeric(grp["yards_per_play"], errors="coerce").tail(12).mean())
-                if "turnovers" in grp.columns:
-                    to_map[t] = float(pd.to_numeric(grp["turnovers"], errors="coerce").tail(12).mean())
+            margins = scored - allowed
+            w = np.exp(np.linspace(-1.6, 0.0, len(g)))
+            w /= w.sum()
 
-    for t in all_teams:
-        g = completed[(completed["home_team"] == t) | (completed["away_team"] == t)].tail(16)
-        if g.empty:
-            continue
-        scored = np.where(g["home_team"] == t, g["home_points"], g["away_points"]).astype(float)
-        allowed = np.where(g["home_team"] == t, g["away_points"], g["home_points"]).astype(float)
-        margins = scored - allowed
-        w = np.exp(np.linspace(-1.6, 0.0, len(g)))
-        w /= w.sum()
+            valid_ypp = ypp_vals[~np.isnan(ypp_vals)]
+            valid_tov = tov_vals[~np.isnan(tov_vals)]
 
-        team_stats[t] = {
-            "off_pts": float(np.sum(scored * w)),
-            "def_pts": float(np.sum(allowed * w)),
-            "margin_std": float(max(np.std(margins), 11.5)),
-            "ypp": ypp_map.get(t, 5.6),
-            "tov": to_map.get(t, 1.3),
-            "games_played": len(g),
-        }
+            team_stats[t] = {
+                "off_pts": float(np.sum(scored * w)),
+                "def_pts": float(np.sum(allowed * w)),
+                "margin_std": float(max(np.std(margins), 11.5)),
+                "ypp": float(np.mean(valid_ypp)) if len(valid_ypp) > 0 else 5.6,
+                "tov": float(np.mean(valid_tov)) if len(valid_tov) > 0 else 1.3,
+                "games_played": len(g),
+            }
 
+    # Fetch Upcoming FBS Games & Live Spreads from ESPN Scoreboard
     espn_cfb_url = "https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?groups=80&limit=200"
     upcoming_games = []
     try:
@@ -990,12 +1020,13 @@ def run_ncaaf_menu(ctx=None):
             val_plays.sort(key=lambda x: x["best_side_prob"] * (1.0 + 0.05 * x["spread_edge"]), reverse=True)
             print(f"\nCompleted {len(upcoming) * 2 * N_SIMS:,} CFB alt-spread sims in {elapsed:.1f}s!")
 
-            completed["abs_margin"] = (completed["home_points"] - completed["away_points"]).abs()
-            rep = generate_100_500_report(completed, ["game_date"], "abs_margin", 14.0)
-            print(
-                f"FBS 2-Yr Blowout Trend (14+ pt margin): Last 100g Weighted {rep[100]['weighted_rate']:.1%} | "
-                f"Last 500g Weighted {rep[500]['weighted_rate']:.1%}"
-            )
+            if not completed.empty:
+                completed["abs_margin"] = (completed["home_points"] - completed["away_points"]).abs()
+                rep = generate_100_500_report(completed, ["game_date"], "abs_margin", 14.0)
+                print(
+                    f"FBS 2-Yr Blowout Trend (14+ pt margin): Last 100g Weighted {rep[100]['weighted_rate']:.1%} | "
+                    f"Last 500g Weighted {rep[500]['weighted_rate']:.1%}"
+                )
 
             for idx, p in enumerate(val_plays[:10], start=1):
                 print(

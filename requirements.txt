@@ -1,0 +1,8 @@
+streamlit
+nflreadpy
+nba_api
+numpy
+pandas
+scipy
+requests
+pyarrow
