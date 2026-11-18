@@ -46,7 +46,7 @@ def generate_100_500_report(df_2yr, sort_cols, target_col, threshold, entity_mas
 #                        NFL DATA & ENGINE LOADER
 # =====================================================================
 def build_nfl_context():
-    print("\nLoading NFL 2-year data, schedules, weather & injuries...")
+    print("\nLoading NFL 2-year data, live rosters, depth charts, weather & injuries...")
     current_season = nfl.get_current_season()
     current_week = nfl.get_current_week()
     seasons = [current_season - 1, current_season]
@@ -97,6 +97,56 @@ def build_nfl_context():
 
     reg_stats["dk_points"], reg_stats["fd_points"] = compute_dfs_points(reg_stats)
 
+    # Load live current-week depth charts to verify true starting QBs (QB1)
+    starting_qbs = set()
+    try:
+        dc_df = nfl.load_depth_charts([current_season]).to_pandas()
+        if not dc_df.empty:
+            if "dt" in dc_df.columns:
+                dc_df = dc_df[dc_df["dt"] == dc_df["dt"].max()]
+            elif "week" in dc_df.columns:
+                dc_df = dc_df[dc_df["week"] == dc_df["week"].max()]
+            rank_col = (
+                "pos_rank"
+                if "pos_rank" in dc_df.columns
+                else ("depth_team" if "depth_team" in dc_df.columns else None)
+            )
+            pos_col = (
+                "pos_abb"
+                if "pos_abb" in dc_df.columns
+                else ("position" if "position" in dc_df.columns else None)
+            )
+            name_dc = (
+                "player_name"
+                if "player_name" in dc_df.columns
+                else ("full_name" if "full_name" in dc_df.columns else None)
+            )
+            if rank_col and pos_col and name_dc:
+                qb1 = dc_df[
+                    (dc_df[pos_col] == "QB")
+                    & (pd.to_numeric(dc_df[rank_col], errors="coerce") == 1)
+                ]
+                starting_qbs = {str(x).strip().lower() for x in qb1[name_dc].dropna()}
+    except Exception:
+        pass
+
+    # Load live current-week active rosters (ACT) so traded/cut/IR players stay accurate
+    active_roster_team = {}
+    try:
+        rost_df = nfl.load_rosters_weekly([current_season]).to_pandas()
+        if not rost_df.empty:
+            rost_df = rost_df[rost_df["week"] == rost_df["week"].max()]
+            if "status" in rost_df.columns:
+                rost_df = rost_df[rost_df["status"].isin(["ACT", "Active"])]
+            r_name = "full_name" if "full_name" in rost_df.columns else "player_name"
+            for _, r in rost_df.iterrows():
+                nm = str(r.get(r_name, "")).strip().lower()
+                if nm:
+                    active_roster_team[nm] = str(r.get("team", "")).strip()
+    except Exception:
+        pass
+
+    # Load weekly NFL injury reports
     out_players = set()
     team_pos_bump = {}
     try:
@@ -230,10 +280,12 @@ def build_nfl_context():
         "def_lookup": def_lookup,
         "out_players": out_players,
         "team_pos_bump": team_pos_bump,
+        "starting_qbs": starting_qbs,
+        "active_roster_team": active_roster_team,
     }
 
 
-def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manual_bump=1.0):
+def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manual_bump=1.0, override_team=None):
     volume_map = {
         "passing_yards": ("attempts", 8),
         "rushing_yards": ("carries", 4),
@@ -244,7 +296,7 @@ def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manua
     recent = p_logs.sort_values("sort_key").tail(15).copy()
     full_name = recent["player_display_name"].iloc[-1]
     position = recent["position"].iloc[-1]
-    player_team = recent[team_col].iloc[-1]
+    player_team = override_team or recent[team_col].iloc[-1]
 
     if stat_col in volume_map:
         vol_col, min_vol = volume_map[stat_col]
@@ -366,11 +418,13 @@ def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manua
 #             ADVANCED NFL DFS POOL & MULTI-LINEUP SOLVER
 # =====================================================================
 def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
-    """Builds a projected NFL DFS player pool with Ownership %, Value & Leverage."""
+    """Builds a projected NFL DFS player pool verified against live depth charts & active rosters."""
     reg_stats = nfl_ctx["reg_stats"]
     team_col = nfl_ctx["team_col"]
     matchup_map = nfl_ctx["matchup_map"]
     out_players = nfl_ctx["out_players"]
+    starting_qbs = nfl_ctx.get("starting_qbs", set())
+    active_roster_team = nfl_ctx.get("active_roster_team", {})
     stat_col = "dk_points" if site == "DK" else "fd_points"
 
     csv_salaries = {}
@@ -386,7 +440,7 @@ def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
                     csv_ids[nm.lower()] = f"{nm} ({row['Id']})"
 
     recent_pool = reg_stats[
-        (reg_stats["season"] == nfl_ctx["season"]) & (reg_stats["week"] >= max(1, nfl_ctx["week"] - 3))
+        (reg_stats["season"] == nfl_ctx["season"]) & (reg_stats["week"] >= max(1, nfl_ctx["week"] - 4))
     ]
     active_players = recent_pool[["player_id", "player_display_name", "position", team_col]].drop_duplicates(
         subset=["player_id"]
@@ -394,17 +448,39 @@ def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
 
     pool = []
     for _, p in active_players.iterrows():
-        if str(p["player_display_name"]).strip().lower() in out_players:
-            continue
-        team, pos = p[team_col], p["position"]
-        if team not in matchup_map or pos not in ["QB", "RB", "WR", "TE"]:
-            continue
-        opp = matchup_map[team]["opponent"]
-        p_logs = reg_stats[reg_stats["player_id"] == p["player_id"]].sort_values("sort_key")
-        if len(p_logs) < 3 or p_logs[stat_col].tail(6).mean() < 4.5:
+        p_name_raw = str(p["player_display_name"]).strip()
+        p_name_low = p_name_raw.lower()
+        if p_name_low in out_players:
             continue
 
-        res = simulate_nfl_prop(nfl_ctx, p_logs, opp, stat_col, 15.0)
+        # Sync to live active roster team if available
+        if active_roster_team:
+            if p_name_low not in active_roster_team:
+                continue
+            team = active_roster_team[p_name_low]
+        else:
+            team = p[team_col]
+
+        pos = p["position"]
+        if team not in matchup_map or pos not in ["QB", "RB", "WR", "TE"]:
+            continue
+
+        p_logs = reg_stats[reg_stats["player_id"] == p["player_id"]].sort_values("sort_key")
+        if len(p_logs) < 3:
+            continue
+
+        # Strictly block backup / non-starting QBs from the DFS pool
+        if pos == "QB":
+            recent_att = p_logs["attempts"].tail(4).mean() if "attempts" in p_logs.columns else 0
+            is_qb1 = (not starting_qbs) or (p_name_low in starting_qbs)
+            if recent_att < 16.0 or not is_qb1:
+                continue
+        else:
+            if p_logs[stat_col].tail(6).mean() < 5.5:
+                continue
+
+        opp = matchup_map[team]["opponent"]
+        res = simulate_nfl_prop(nfl_ctx, p_logs, opp, stat_col, 15.0, override_team=team)
         name_lower = res["player"].lower()
 
         if csv_salaries and name_lower not in csv_salaries:
@@ -415,18 +491,18 @@ def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
         else:
             if site == "DK":
                 base_sal = {
-                    "QB": 4600 + (res["proj"] * 175),
-                    "RB": 4000 + (res["proj"] * 240),
-                    "WR": 3500 + (res["proj"] * 235),
-                    "TE": 2800 + (res["proj"] * 245),
+                    "QB": 4800 + (res["proj"] * 170),
+                    "RB": 4200 + (res["proj"] * 235),
+                    "WR": 3600 + (res["proj"] * 230),
+                    "TE": 3000 + (res["proj"] * 240),
                 }[pos]
-                salary = int(np.clip(round(base_sal / 100) * 100, 3000, 9500))
+                salary = int(np.clip(round(base_sal / 100) * 100, 3200, 9500))
             else:
                 base_sal = {
-                    "QB": 6000 + (res["proj"] * 185),
-                    "RB": 5000 + (res["proj"] * 260),
-                    "WR": 4800 + (res["proj"] * 255),
-                    "TE": 4200 + (res["proj"] * 260),
+                    "QB": 6200 + (res["proj"] * 180),
+                    "RB": 5200 + (res["proj"] * 255),
+                    "WR": 4900 + (res["proj"] * 250),
+                    "TE": 4300 + (res["proj"] * 255),
                 }[pos]
                 salary = int(np.clip(round(base_sal / 100) * 100, 4500, 10500))
 
