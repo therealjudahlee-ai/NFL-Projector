@@ -50,7 +50,7 @@ def ensure_nba_dk_pts(df):
     return df
 
 
-@st.cache_resource(show_spinner="Loading NFL 2-year stats, weather & injuries...")
+@st.cache_resource(show_spinner="Loading NFL 2-year stats, live rosters, depth charts & IR/injuries...")
 def get_nfl():
     return pro_sim.build_nfl_context()
 
@@ -137,7 +137,7 @@ if sport_tab == "🏈 NFL":
 
             legs = []
             for _, p in active.iterrows():
-                if str(p["player_display_name"]).strip().lower() in ctx["out_players"]:
+                if pro_sim._norm_name(p["player_display_name"]) in ctx["out_players"]:
                     continue
                 t, pos = p[team_col], p["position"]
                 if t not in matchup_map or pos not in pos_props:
@@ -221,7 +221,11 @@ if sport_tab == "🏈 NFL":
 
     with mode[3]:
         st.markdown("### 🏆 Pro NFL DFS Lineup Builder (Stacking, Bring-Backs, Leverage & Multi-Lineup)")
-        uploaded_csv = st.file_uploader("Optional: Upload DraftKings / FanDuel Salaries CSV", type=["csv"], key="nfl_csv")
+        uploaded_csv = st.file_uploader(
+            "Upload DraftKings ('DKSalaries.csv') or FanDuel ('FanDuel-NFL.csv') for 100% Exact Slate Prices",
+            type=["csv"],
+            key="nfl_csv",
+        )
         custom_df = pd.read_csv(uploaded_csv) if uploaded_csv is not None else None
 
         c1, c2, c3, c4 = st.columns(4)
@@ -250,11 +254,21 @@ if sport_tab == "🏈 NFL":
         df_pool = pro_sim.build_nfl_dfs_pool(ctx, site=site_code, custom_csv_df=custom_df)
         all_names = sorted(df_pool["name"].tolist()) if not df_pool.empty else []
 
+        if not df_pool.empty and "salary_source" in df_pool.columns:
+            src_txt = df_pool["salary_source"].iloc[0]
+            if "Exact" in src_txt and "Estimated" not in src_txt:
+                st.success(f"**Salary Data Source:** {src_txt}")
+            else:
+                st.warning(
+                    f"**Salary Data Source:** {src_txt} — DraftKings/FanDuel block automated cloud scraping, "
+                    "so upload your contest CSV above whenever you want exact down-to-the-dollar slate salaries."
+                )
+
         lc1, lc2 = st.columns(2)
         locked = lc1.multiselect("🔒 Lock Core Players", all_names, key="nfl_lock")
         excluded = lc2.multiselect("🚫 Exclude Players", [n for n in all_names if n not in locked], key="nfl_excl")
 
-        st.caption(f"Player Pool Loaded: **{len(df_pool)}** players across **{len(matchup_map) // 2}** Week {ctx['week']} games.")
+        st.caption(f"Player Pool Loaded: **{len(df_pool)}** active players across **{len(matchup_map) // 2}** Week {ctx['week']} games.")
 
         if st.button("🚀 Generate Optimal NFL DFS Lineups", key="run_nfl_dfs", type="primary"):
             if df_pool.empty:
@@ -438,7 +452,11 @@ elif sport_tab == "🏀 NBA":
 
     with mode[3]:
         st.markdown("### 🏆 NBA DFS Lineup Builder (8-Player Roster under $50,000)")
-        nba_csv = st.file_uploader("Optional: Upload DraftKings NBA Salaries CSV", type=["csv"], key="nba_csv")
+        nba_csv = st.file_uploader(
+            "Upload DraftKings ('DKSalaries.csv') or FanDuel NBA CSV for 100% Exact Slate Prices",
+            type=["csv"],
+            key="nba_csv",
+        )
         nba_custom_df = pd.read_csv(nba_csv) if nba_csv is not None else None
 
         c1, c2, c3, c4 = st.columns(4)
@@ -450,6 +468,15 @@ elif sport_tab == "🏀 NBA":
 
         nba_pool = pro_sim.build_nba_dfs_pool(ctx, custom_csv_df=nba_custom_df)
         nba_names = sorted(nba_pool["name"].tolist()) if not nba_pool.empty else []
+
+        if not nba_pool.empty and "salary_source" in nba_pool.columns:
+            src_txt = nba_pool["salary_source"].iloc[0]
+            if "Exact" in src_txt and "Estimated" not in src_txt:
+                st.success(f"**Salary Data Source:** {src_txt}")
+            else:
+                st.warning(
+                    f"**Salary Data Source:** {src_txt} — Upload your DraftKings/FanDuel NBA CSV above for exact slate salaries."
+                )
 
         lc1, lc2 = st.columns(2)
         nba_locked = lc1.multiselect("🔒 Lock NBA Core", nba_names, key="nba_lock")
