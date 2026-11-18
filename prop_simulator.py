@@ -58,7 +58,7 @@ def build_nfl_context():
     reg_stats["sort_key"] = reg_stats["season"] * 100 + reg_stats["week"]
     team_col = "team" if "team" in reg_stats.columns else "recent_team"
 
-    def compute_dk_points(df):
+    def compute_dfs_points(df):
         def get_col(*names):
             for name in names:
                 if name in df.columns:
@@ -75,20 +75,28 @@ def build_nfl_context():
         rec_tds = get_col("receiving_tds")
         fumbles = get_col("rushing_fumbles_lost") + get_col("receiving_fumbles_lost")
 
-        pts = (
+        # DraftKings: Full PPR + 300/100 yd 3-pt bonuses
+        dk = (
             (pass_yds * 0.04) + (pass_tds * 4.0) - (ints * 1.0)
             + (rush_yds * 0.1) + (rush_tds * 6.0)
             + (rec * 1.0) + (rec_yds * 0.1) + (rec_tds * 6.0)
             - (fumbles * 1.0)
         )
-        pts += np.where(pass_yds >= 300, 3.0, 0.0)
-        pts += np.where(rush_yds >= 100, 3.0, 0.0)
-        pts += np.where(rec_yds >= 100, 3.0, 0.0)
-        return pts
+        dk += np.where(pass_yds >= 300, 3.0, 0.0)
+        dk += np.where(rush_yds >= 100, 3.0, 0.0)
+        dk += np.where(rec_yds >= 100, 3.0, 0.0)
 
-    reg_stats["dk_points"] = compute_dk_points(reg_stats)
+        # FanDuel: Half PPR, no yardage bonuses
+        fd = (
+            (pass_yds * 0.04) + (pass_tds * 4.0) - (ints * 1.0)
+            + (rush_yds * 0.1) + (rush_tds * 6.0)
+            + (rec * 0.5) + (rec_yds * 0.1) + (rec_tds * 6.0)
+            - (fumbles * 2.0)
+        )
+        return dk, fd
 
-    # Load weekly NFL injury reports
+    reg_stats["dk_points"], reg_stats["fd_points"] = compute_dfs_points(reg_stats)
+
     out_players = set()
     team_pos_bump = {}
     try:
@@ -114,7 +122,6 @@ def build_nfl_context():
     except Exception:
         pass
 
-    # Team offensive/defensive scoring & margin volatility (for 1M-sim Sneaky Blowout detection)
     completed_sched = schedules.dropna(subset=["home_score", "away_score"]).sort_values(["season", "week"])
     team_off_pts, team_def_pts, team_margin_std = {}, {}, {}
     all_teams = set(completed_sched["home_team"]).union(set(completed_sched["away_team"]))
@@ -135,7 +142,6 @@ def build_nfl_context():
         team_def_pts[t] = float(np.sum(allowed * w))
         team_margin_std[t] = float(max(np.std(margins), 8.5))
 
-    # Map current week matchups + Weather + 1,000,000-Sim Blowout Probability
     curr_sched = schedules[schedules["season"] == current_season]
     wk_games = curr_sched[curr_sched["week"] == current_week].copy()
     matchup_map = {}
@@ -189,11 +195,10 @@ def build_nfl_context():
                 "is_thursday": is_thursday,
             }
 
-    # Recency-weighted defensive lookup
     def_lookup = {}
     all_stats = [
         "passing_yards", "rushing_yards", "receiving_yards", "receptions",
-        "passing_tds", "rushing_tds", "receiving_tds", "dk_points",
+        "passing_tds", "rushing_tds", "receiving_tds", "dk_points", "fd_points",
     ]
     for pos in ["QB", "RB", "WR", "TE"]:
         pos_df = reg_stats[reg_stats["position"] == pos]
@@ -289,9 +294,7 @@ def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manua
         if blowout_prob >= 0.35:
             if stat_col in ["passing_yards", "receiving_yards", "receptions"] and team_spread <= -7.0:
                 blowout_penalty = 0.93
-            flags.append(
-                f"{'SNEAKY ' if sneaky_blowout else ''}BLOWOUT RISK {blowout_prob:.0%}"
-            )
+            flags.append(f"{'SNEAKY ' if sneaky_blowout else ''}BLOWOUT RISK {blowout_prob:.0%}")
 
         if auto_bump > 1.0:
             flags.append(f"Teammate Out Bump {auto_bump:.2f}x")
@@ -360,6 +363,254 @@ def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manua
 
 
 # =====================================================================
+#             ADVANCED NFL DFS POOL & MULTI-LINEUP SOLVER
+# =====================================================================
+def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
+    """Builds a projected NFL DFS player pool with Ownership %, Value & Leverage."""
+    reg_stats = nfl_ctx["reg_stats"]
+    team_col = nfl_ctx["team_col"]
+    matchup_map = nfl_ctx["matchup_map"]
+    out_players = nfl_ctx["out_players"]
+    stat_col = "dk_points" if site == "DK" else "fd_points"
+
+    csv_salaries = {}
+    csv_ids = {}
+    if custom_csv_df is not None and not custom_csv_df.empty:
+        for _, row in custom_csv_df.iterrows():
+            nm = str(row.get("Name", row.get("Nickname", ""))).strip()
+            if nm:
+                csv_salaries[nm.lower()] = int(pd.to_numeric(row.get("Salary", 5000), errors="coerce") or 5000)
+                if "Name + ID" in row:
+                    csv_ids[nm.lower()] = str(row["Name + ID"])
+                elif "Id" in row:
+                    csv_ids[nm.lower()] = f"{nm} ({row['Id']})"
+
+    recent_pool = reg_stats[
+        (reg_stats["season"] == nfl_ctx["season"]) & (reg_stats["week"] >= max(1, nfl_ctx["week"] - 3))
+    ]
+    active_players = recent_pool[["player_id", "player_display_name", "position", team_col]].drop_duplicates(
+        subset=["player_id"]
+    )
+
+    pool = []
+    for _, p in active_players.iterrows():
+        if str(p["player_display_name"]).strip().lower() in out_players:
+            continue
+        team, pos = p[team_col], p["position"]
+        if team not in matchup_map or pos not in ["QB", "RB", "WR", "TE"]:
+            continue
+        opp = matchup_map[team]["opponent"]
+        p_logs = reg_stats[reg_stats["player_id"] == p["player_id"]].sort_values("sort_key")
+        if len(p_logs) < 3 or p_logs[stat_col].tail(6).mean() < 4.5:
+            continue
+
+        res = simulate_nfl_prop(nfl_ctx, p_logs, opp, stat_col, 15.0)
+        name_lower = res["player"].lower()
+
+        if csv_salaries and name_lower not in csv_salaries:
+            continue
+
+        if name_lower in csv_salaries:
+            salary = csv_salaries[name_lower]
+        else:
+            if site == "DK":
+                base_sal = {
+                    "QB": 4600 + (res["proj"] * 175),
+                    "RB": 4000 + (res["proj"] * 240),
+                    "WR": 3500 + (res["proj"] * 235),
+                    "TE": 2800 + (res["proj"] * 245),
+                }[pos]
+                salary = int(np.clip(round(base_sal / 100) * 100, 3000, 9500))
+            else:
+                base_sal = {
+                    "QB": 6000 + (res["proj"] * 185),
+                    "RB": 5000 + (res["proj"] * 260),
+                    "WR": 4800 + (res["proj"] * 255),
+                    "TE": 4200 + (res["proj"] * 260),
+                }[pos]
+                salary = int(np.clip(round(base_sal / 100) * 100, 4500, 10500))
+
+        val = (res["proj"] / salary) * 1000.0
+        team_pts = matchup_map[team]["team_proj_pts"]
+        # Estimate field ownership % from value + implied team score
+        est_own = float(np.clip(((val - 1.6) * 8.5) + ((team_pts - 21.0) * 1.1), 1.5, 38.0))
+        leverage_pts = float(res["ceiling"] * (1.0 - (est_own / 100.0) * 0.45))
+
+        pool.append(
+            {
+                "name": res["player"],
+                "dk_id": csv_ids.get(name_lower, res["player"]),
+                "pos": pos,
+                "team": team,
+                "opp": opp,
+                "game": res["game"],
+                "salary": salary,
+                "proj": round(res["proj"], 2),
+                "ceiling": round(res["ceiling"], 2),
+                "est_own": round(est_own, 1),
+                "leverage": round(leverage_pts, 2),
+                "value": round(val, 2),
+                "flags": res["flags"],
+            }
+        )
+
+    for team, info in matchup_map.items():
+        opp = info["opponent"]
+        opp_implied = (info["total_line"] / 2.0) + (info["team_spread"] / 2.0)
+        dst_proj = float(np.clip(13.5 - (opp_implied * 0.32), 3.0, 12.0))
+        dst_ceil = dst_proj + 5.5
+        dst_name = f"{team} DST"
+        if csv_salaries and dst_name.lower() not in csv_salaries and team.lower() not in csv_salaries:
+            continue
+        sal = csv_salaries.get(
+            dst_name.lower(),
+            csv_salaries.get(
+                team.lower(),
+                int(np.clip(round(((2200 if site == "DK" else 3200) + dst_proj * 210) / 100) * 100, 2200, 5200)),
+            ),
+        )
+        val = (dst_proj / sal) * 1000.0
+        est_own = float(np.clip((val - 1.5) * 6.5, 2.0, 24.0))
+        pool.append(
+            {
+                "name": dst_name,
+                "dk_id": csv_ids.get(dst_name.lower(), dst_name),
+                "pos": "DST",
+                "team": team,
+                "opp": opp,
+                "game": info["game_label"],
+                "salary": sal,
+                "proj": round(dst_proj, 2),
+                "ceiling": round(dst_ceil, 2),
+                "est_own": round(est_own, 1),
+                "leverage": round(dst_ceil * (1.0 - (est_own / 100.0) * 0.45), 2),
+                "value": round(val, 2),
+                "flags": f"Opp Implied: {opp_implied:.1f}",
+            }
+        )
+
+    return pd.DataFrame(pool)
+
+
+def optimize_nfl_dfs_lineups(
+    df_pool,
+    site="DK",
+    mode="gpp",
+    num_lineups=1,
+    min_unique=2,
+    max_exposure=0.65,
+    stack_type="qb_1_bringback",
+    no_opp_vs_dst=True,
+    max_1_rb_per_team=True,
+    locked_names=None,
+    excluded_names=None,
+):
+    """Solves 1 to 20 optimal NFL DFS lineups with stacking, bring-backs, anti-cannibalization & exposure."""
+    if df_pool.empty:
+        return []
+
+    locked_names = {x.lower() for x in (locked_names or [])}
+    excluded_names = {x.lower() for x in (excluded_names or [])}
+
+    salary_cap = 50000 if site == "DK" else 60000
+    score_col = {"cash": "proj", "gpp": "ceiling", "leverage": "leverage"}[mode]
+
+    n = len(df_pool)
+    base_constraints = [
+        LinearConstraint(df_pool["salary"].values, 0, salary_cap),
+        LinearConstraint((df_pool["pos"] == "QB").astype(float).values, 1, 1),
+        LinearConstraint((df_pool["pos"] == "DST").astype(float).values, 1, 1),
+        LinearConstraint((df_pool["pos"] == "RB").astype(float).values, 2, 3),
+        LinearConstraint((df_pool["pos"] == "WR").astype(float).values, 3, 4),
+        LinearConstraint((df_pool["pos"] == "TE").astype(float).values, 1, 2),
+        LinearConstraint(df_pool["pos"].isin(["RB", "WR", "TE"]).astype(float).values, 7, 7),
+    ]
+
+    # Lock / Exclude constraints
+    lb = np.zeros(n)
+    ub = np.ones(n)
+    for idx, row in df_pool.iterrows():
+        nm = row["name"].lower()
+        if nm in excluded_names:
+            ub[idx] = 0.0
+        elif nm in locked_names:
+            lb[idx] = 1.0
+
+    # Game Stacking & Opponent Bring-Back Constraints
+    teams = df_pool["team"].unique()
+    for t in teams:
+        qb_t = ((df_pool["team"] == t) & (df_pool["pos"] == "QB")).astype(float).values
+        pc_t = ((df_pool["team"] == t) & (df_pool["pos"].isin(["WR", "TE"]))).astype(float).values
+        opp_teams = df_pool[df_pool["team"] == t]["opp"].unique()
+        opp_skill = ((df_pool["team"].isin(opp_teams)) & (df_pool["pos"].isin(["WR", "TE", "RB"]))).astype(float).values
+
+        if stack_type in ["qb_1", "qb_1_bringback"]:
+            base_constraints.append(LinearConstraint(pc_t - qb_t, 0, np.inf))
+        elif stack_type in ["qb_2", "qb_2_bringback"]:
+            base_constraints.append(LinearConstraint(pc_t - (2.0 * qb_t), 0, np.inf))
+
+        if "bringback" in stack_type:
+            base_constraints.append(LinearConstraint(opp_skill - qb_t, 0, np.inf))
+
+        # Anti-Cannibalization: No opposing skill players against selected DST
+        if no_opp_vs_dst:
+            dst_t = ((df_pool["team"] == t) & (df_pool["pos"] == "DST")).astype(float).values
+            if dst_t.sum() > 0 and opp_skill.sum() > 0:
+                # If DST is selected (1), opp_skill must be 0
+                base_constraints.append(LinearConstraint(opp_skill + (7.0 * dst_t), 0, 7.0))
+
+        # Max 1 RB per team
+        if max_1_rb_per_team:
+            rb_t = ((df_pool["team"] == t) & (df_pool["pos"] == "RB")).astype(float).values
+            if rb_t.sum() > 1:
+                base_constraints.append(LinearConstraint(rb_t, 0, 1))
+
+    lineups = []
+    appearance_counts = np.zeros(n)
+    max_appearances = max(1, int(np.ceil(num_lineups * max_exposure)))
+
+    for lu_idx in range(num_lineups):
+        # Enforce max exposure for non-locked players
+        cur_ub = ub.copy()
+        if lu_idx > 0:
+            for i in range(n):
+                if lb[i] < 0.5 and appearance_counts[i] >= max_appearances:
+                    cur_ub[i] = 0.0
+
+        res_opt = milp(
+            c=-df_pool[score_col].values,
+            integrality=np.ones(n),
+            bounds=Bounds(lb, cur_ub),
+            constraints=base_constraints,
+        )
+        if not res_opt.success:
+            break
+
+        sel_mask = res_opt.x > 0.5
+        appearance_counts[sel_mask] += 1
+
+        chosen = df_pool[sel_mask].copy()
+        chosen["order"] = chosen["pos"].map({"QB": 1, "RB": 2, "WR": 3, "TE": 4, "DST": 5})
+        chosen = chosen.sort_values(["order", "proj"], ascending=[True, False]).reset_index(drop=True)
+
+        counts = {"QB": 0, "RB": 0, "WR": 0, "TE": 0, "DST": 0}
+        limits = {"QB": 1, "RB": 2, "WR": 3, "TE": 1, "DST": 1}
+        slots = []
+        for _, r in chosen.iterrows():
+            p = r["pos"]
+            counts[p] += 1
+            slots.append("FLEX" if counts[p] > limits[p] else p)
+        chosen["slot"] = slots
+        lineups.append(chosen)
+
+        # Uniqueness constraint for next lineup: overlap <= (9 - min_unique)
+        prev_vec = sel_mask.astype(float)
+        base_constraints.append(LinearConstraint(prev_vec, 0, 9 - min_unique))
+
+    return lineups
+
+
+# =====================================================================
 #                        NBA DATA & ENGINE LOADER
 # =====================================================================
 def build_nba_context(target_date_str=None):
@@ -373,7 +624,6 @@ def build_nba_context(target_date_str=None):
     prev_szn = f"{start_year - 1}-{str(start_year)[-2:]}"
 
     dfs = []
-    # 1. Try official nba_api first (works on local home/work PCs)
     for szn in [prev_szn, curr_szn]:
         try:
             logs = leaguegamelog.LeagueGameLog(
@@ -387,7 +637,6 @@ def build_nba_context(target_date_str=None):
         except Exception:
             pass
 
-    # 2. Cloud Fallback: If stats.nba.com blocks Streamlit Cloud IP, load from HoopR GitHub parquet
     if not dfs:
         for yr in [start_year, start_year + 1]:
             url = f"https://github.com/sportsdataverse/sportsdataverse-data/releases/download/espn_nba_player_boxscores/player_box_{yr}.parquet"
@@ -409,10 +658,10 @@ def build_nba_context(target_date_str=None):
                     "FG3M": pd.to_numeric(raw["three_point_field_goals_made"], errors="coerce").fillna(0),
                     "STL": pd.to_numeric(raw["steals"], errors="coerce").fillna(0),
                     "BLK": pd.to_numeric(raw["blocks"], errors="coerce").fillna(0),
+                    "TOV": pd.to_numeric(raw["turnovers"], errors="coerce").fillna(0),
                     "FGA": pd.to_numeric(raw["field_goals_attempted"], errors="coerce").fillna(0),
                     "FTA": pd.to_numeric(raw["free_throws_attempted"], errors="coerce").fillna(0),
                     "OREB": pd.to_numeric(raw["offensive_rebounds"], errors="coerce").fillna(0),
-                    "TOV": pd.to_numeric(raw["turnovers"], errors="coerce").fillna(0),
                     "IS_HOME": raw["home_away"].astype(str).str.lower() == "home",
                 })
                 dfs.append(mapped)
@@ -427,7 +676,6 @@ def build_nba_context(target_date_str=None):
     if "OPP_ABBR" not in nba_df.columns:
         nba_df["OPP_ABBR"] = nba_df["MATCHUP"].apply(lambda x: str(x).split()[-1].strip())
 
-    # Normalize ESPN team abbreviations to standard 3-letter codes
     abbr_fix = {"GS": "GSW", "NY": "NYK", "NO": "NOP", "SA": "SAS", "WSH": "WAS", "UTAH": "UTA"}
     nba_df["TEAM_ABBREVIATION"] = nba_df["TEAM_ABBREVIATION"].replace(abbr_fix)
     nba_df["OPP_ABBR"] = nba_df["OPP_ABBR"].replace(abbr_fix)
@@ -436,6 +684,26 @@ def build_nba_context(target_date_str=None):
     nba_df["PR"] = nba_df["PTS"] + nba_df["REB"]
     nba_df["PA"] = nba_df["PTS"] + nba_df["AST"]
     nba_df["RA"] = nba_df["REB"] + nba_df["AST"]
+
+    # DraftKings NBA Fantasy Points (with Double-Double / Triple-Double bonuses)
+    dd_cats = (
+        (nba_df["PTS"] >= 10).astype(int)
+        + (nba_df["REB"] >= 10).astype(int)
+        + (nba_df["AST"] >= 10).astype(int)
+        + (nba_df["STL"] >= 10).astype(int)
+        + (nba_df["BLK"] >= 10).astype(int)
+    )
+    nba_df["DK_PTS"] = (
+        nba_df["PTS"] * 1.0
+        + nba_df["FG3M"] * 0.5
+        + nba_df["REB"] * 1.25
+        + nba_df["AST"] * 1.5
+        + nba_df["STL"] * 2.0
+        + nba_df["BLK"] * 2.0
+        - nba_df["TOV"] * 0.5
+        + np.where(dd_cats >= 2, 1.5, 0.0)
+        + np.where(dd_cats >= 3, 3.0, 0.0)
+    )
 
     agg_dict = {"PTS": "sum", "FGA": "sum", "FTA": "sum", "OREB": "sum", "TOV": "sum"}
     if "FG3A" in nba_df.columns:
@@ -484,7 +752,6 @@ def build_nba_context(target_date_str=None):
                 if pid not in set(grp[grp["GAME_ID"].isin(last_2_gids)]["PLAYER_ID"]):
                     team_usage_bump[t] = min(1.12, team_usage_bump.get(t, 1.0) + 0.05)
 
-    # Fetch Today's NBA Matchups via ESPN's Open Scoreboard API (never blocked on cloud!)
     nba_matchups = {}
     todays_games = []
     target_dt = pd.to_datetime(target_date_str)
@@ -551,7 +818,7 @@ def build_nba_context(target_date_str=None):
         print(f"[!] Could not fetch NBA schedule for {target_date_str}: {e}")
 
     def_lookup = {}
-    for stat in ["PTS", "REB", "AST", "FG3M", "STL", "BLK", "PRA", "PR", "PA", "RA"]:
+    for stat in ["PTS", "REB", "AST", "FG3M", "STL", "BLK", "PRA", "PR", "PA", "RA", "DK_PTS"]:
         game_totals = (
             nba_df.groupby(["OPP_ABBR", "GAME_ID", "GAME_DATE"])[stat]
             .sum()
@@ -625,16 +892,12 @@ def simulate_nba_prop(ctx, p_logs, opponent_abbr, stat_col, prop_line=0.0, manua
 
         if blowout_prob >= 0.34 and ewm_min >= 26.0:
             min_adj_mult = 0.92
-            flags.append(
-                f"{'SNEAKY ' if sneaky_blowout else ''}BLOWOUT RISK {blowout_prob:.0%} (-8% Min)"
-            )
+            flags.append(f"{'SNEAKY ' if sneaky_blowout else ''}BLOWOUT RISK {blowout_prob:.0%} (-8% Min)")
 
         if auto_bump > 1.0:
             flags.append(f"Teammate Out Bump {auto_bump:.2f}x")
 
-        script_note = (
-            f"Proj Total: {comp_total:.1f} | Pace: {pace_mult:.2f}x | Blowout Prob: {blowout_prob:.0%}"
-        )
+        script_note = f"Proj Total: {comp_total:.1f} | Pace: {pace_mult:.2f}x | Blowout Prob: {blowout_prob:.0%}"
     else:
         comp_total = 228.0
         script_note = "Comp Game Total Est: 228.0 pts"
@@ -675,6 +938,104 @@ def simulate_nba_prop(ctx, p_logs, opponent_abbr, stat_col, prop_line=0.0, manua
         "breakdown": f"{adj_min:.1f} mins x {adj_rate:.2f} {stat_col}/min",
         "games_used": len(healthy),
     }
+
+
+def build_nba_dfs_pool(nba_ctx, custom_csv_df=None):
+    """Builds projected DraftKings NBA DFS pool (8-man roster under $50,000)."""
+    nba_df = nba_ctx["nba_df"]
+    matchup_map = nba_ctx["matchup_map"]
+
+    csv_salaries = {}
+    if custom_csv_df is not None and not custom_csv_df.empty:
+        for _, row in custom_csv_df.iterrows():
+            nm = str(row.get("Name", "")).strip()
+            if nm:
+                csv_salaries[nm.lower()] = int(pd.to_numeric(row.get("Salary", 5000), errors="coerce") or 5000)
+
+    cutoff = nba_df["GAME_DATE"].max() - pd.Timedelta(days=14)
+    active_ids = nba_df[nba_df["GAME_DATE"] >= cutoff]["PLAYER_ID"].unique()
+    pool = []
+
+    for pid in active_ids:
+        p_logs = nba_df[nba_df["PLAYER_ID"] == pid].sort_values("GAME_DATE")
+        t = p_logs["TEAM_ABBREVIATION"].iloc[-1]
+        if t not in matchup_map or len(p_logs) < 4:
+            continue
+        h = p_logs[p_logs["MIN"] >= 12.0].tail(12)
+        if len(h) < 4 or h["MIN"].mean() < 16.0:
+            continue
+
+        res = simulate_nba_prop(nba_ctx, p_logs, matchup_map[t]["opponent"], "DK_PTS", 25.0)
+        nm_lower = res["player"].lower()
+        if csv_salaries and nm_lower not in csv_salaries:
+            continue
+
+        sal = csv_salaries.get(nm_lower, int(np.clip(round((3000 + res["proj"] * 175) / 100) * 100, 3000, 11800)))
+        val = (res["proj"] / sal) * 1000.0
+        est_own = float(np.clip((val - 4.2) * 9.0, 2.0, 42.0))
+        pool.append({
+            "name": res["player"],
+            "team": t,
+            "opp": matchup_map[t]["opponent"],
+            "game": res["game"],
+            "salary": sal,
+            "proj": round(res["proj"], 2),
+            "ceiling": round(res["ceiling"], 2),
+            "est_own": round(est_own, 1),
+            "leverage": round(res["ceiling"] * (1.0 - (est_own / 100.0) * 0.45), 2),
+            "value": round(val, 2),
+            "flags": res["flags"],
+        })
+    return pd.DataFrame(pool)
+
+
+def optimize_nba_dfs_lineups(df_pool, mode="gpp", num_lineups=1, min_unique=2, max_exposure=0.65, locked_names=None, excluded_names=None):
+    """Solves 1 to 20 optimal 8-player NBA DFS lineups under $50,000."""
+    if df_pool.empty:
+        return []
+    locked_names = {x.lower() for x in (locked_names or [])}
+    excluded_names = {x.lower() for x in (excluded_names or [])}
+    score_col = {"cash": "proj", "gpp": "ceiling", "leverage": "leverage"}[mode]
+
+    n = len(df_pool)
+    constraints = [
+        LinearConstraint(df_pool["salary"].values, 0, 50000),
+        LinearConstraint(np.ones(n), 8, 8),
+    ]
+    # Max 4 players per NBA game to avoid over-concentration
+    for g in df_pool["game"].unique():
+        g_vec = (df_pool["game"] == g).astype(float).values
+        constraints.append(LinearConstraint(g_vec, 0, 4))
+
+    lb, ub = np.zeros(n), np.ones(n)
+    for i, r in df_pool.iterrows():
+        nm = r["name"].lower()
+        if nm in excluded_names:
+            ub[i] = 0.0
+        elif nm in locked_names:
+            lb[i] = 1.0
+
+    lineups = []
+    counts = np.zeros(n)
+    max_app = max(1, int(np.ceil(num_lineups * max_exposure)))
+
+    for lu_i in range(num_lineups):
+        cur_ub = ub.copy()
+        if lu_i > 0:
+            for i in range(n):
+                if lb[i] < 0.5 and counts[i] >= max_app:
+                    cur_ub[i] = 0.0
+        res = milp(c=-df_pool[score_col].values, integrality=np.ones(n), bounds=Bounds(lb, cur_ub), constraints=constraints)
+        if not res.success:
+            break
+        sel = res.x > 0.5
+        counts[sel] += 1
+        chosen = df_pool[sel].sort_values("proj", ascending=False).reset_index(drop=True)
+        chosen["slot"] = ["PG", "SG", "SF", "PF", "C", "G", "F", "UTIL"][:len(chosen)]
+        lineups.append(chosen)
+        constraints.append(LinearConstraint(sel.astype(float), 0, 8 - min_unique))
+
+    return lineups
 
 
 # =====================================================================
@@ -728,35 +1089,6 @@ def display_2x_3x_report(top_plays, min_prob, max_prob, sport_label, df_source, 
             f"Weighted Hit Rate {d100['weighted_rate']:.1%} (100g) / {d500['weighted_rate']:.1%} (500g)"
         )
 
-    if len(top_plays) >= 2:
-        print("\n" + "=" * 86)
-        print(f" SUGGESTED {sport_label} 2-LEG & 3-LEG HIGH-MULTIPLIER PARLAYS")
-        print("=" * 86)
-        for n_legs in [2, 3]:
-            if len(top_plays) < n_legs:
-                continue
-            best_combo, best_score = None, -1.0
-            for combo in itertools.combinations(top_plays[:10], n_legs):
-                if len({c["game"] for c in combo}) < n_legs:
-                    continue
-                score = sum(c["value_score"] for c in combo)
-                if score > best_score:
-                    best_score = score
-                    best_combo = combo
-
-            if best_combo:
-                comb_prob = float(np.prod([c["over_prob"] for c in best_combo]))
-                comb_payout = 1.0 / comb_prob if comb_prob > 0 else 0
-                print(
-                    f"\nBest {n_legs}-Leg {sport_label} Value Slip | Combined Prob: {comb_prob:.1%} "
-                    f"(Est. Payout Multiplier: {comb_payout:.1f}x)"
-                )
-                for leg in best_combo:
-                    print(
-                        f"   -> {leg['player']} ({leg['team']}) OVER {leg['line']} {leg['stat']} "
-                        f"[{leg['over_prob']:.1%} | {leg['fair_mult']:.2f}x | {leg['game']}]"
-                    )
-
 
 # =====================================================================
 #                         NFL INTERACTIVE MENU
@@ -789,14 +1121,13 @@ def run_nfl_menu(nfl_ctx=None):
         print(f"\nNFL Simulator Menu (Season {current_season} | Week {current_week}):")
         print("  [1] Single Player Prop Simulator (1,000,000 Sims)")
         print("  [2] Auto-Scan This Week's Matchups & Build Parlays (1,000,000 Sims/Prop)")
-        print("  [3] NFL DFS Lineup Projector & Optimizer ($50k Salary Cap)")
+        print("  [3] Pro NFL DFS Lineup Optimizer (Stacking + Bring-Back + Leverage + Multi-Lineup)")
         print("  [4] NFL 2x–3x Value Finder (30%–50% Hit Rate + 100/500 Report)")
         print("  [5] Switch Sport / Back to Main Menu")
         choice = input("Select [1/2/3/4/5]: ").strip()
 
         if choice == "1":
             print("\n--- NFL SINGLE PLAYER PROP SIMULATOR (1,000,000 SIMS) ---")
-            print("Stats: passing_yards, rushing_yards, receiving_yards, receptions, dk_points, passing_tds, rushing_tds, receiving_tds")
             player = input("\nPlayer Name (e.g., Josh Allen): ").strip()
             p_logs = reg_stats[reg_stats["player_display_name"].str.contains(player, case=False, na=False)]
             if p_logs.empty:
@@ -809,7 +1140,7 @@ def run_nfl_menu(nfl_ctx=None):
                 input(f"Opponent Team Abbr [Press Enter for Week {current_week} opp: {auto_opp}]: ").strip().upper()
                 or auto_opp
             )
-            stat = input("Stat (e.g., passing_yards, rushing_yards, receiving_yards, dk_points): ").strip().lower()
+            stat = input("Stat (passing_yards, rushing_yards, receiving_yards, receptions, dk_points): ").strip().lower()
             if stat not in reg_stats.columns:
                 print(f"[!] Invalid stat '{stat}'.")
                 continue
@@ -820,38 +1151,29 @@ def run_nfl_menu(nfl_ctx=None):
                 continue
 
             star_out = input("Is a key teammate OUT tonight? [y/N]: ").strip().lower() == "y"
-            manual_bump = 1.08 if star_out else 1.0
-
-            t0 = time.time()
-            res = simulate_nfl_prop(nfl_ctx, p_logs, opp, stat, line, manual_bump=manual_bump)
-            elapsed = time.time() - t0
+            res = simulate_nfl_prop(nfl_ctx, p_logs, opp, stat, line, manual_bump=(1.08 if star_out else 1.0))
 
             print("\n" + "=" * 70)
             print(f" {res['player']} ({res['position']} - {res['team']}) vs. {res['opponent']} | {res['stat'].upper()} {res['line']}")
             print("=" * 70)
-            print(f" Sims Run:          {N_SIMS:,} (Completed in {elapsed:.2f}s)")
             print(f" Healthy Games:     {res['games_used']} | Consistency Score: {res['consistency']:.0%}")
             print(f" Matchup & Script:  {res['script_note']}")
             print(f" Context Flags:     {res['flags']}")
-            print(f" Engine Breakdown:  {res['breakdown']} (Def: {res['def_mult']:.2f}x)")
-            print("-" * 70)
             print(f" Median Projection: {res['proj']:.1f}  (Floor: {res['floor']:.1f} | Ceiling: {res['ceiling']:.1f})")
             print(f" OVER {res['line']:<5} Prob: {res['over_prob']:.2%}  (Fair Payout: {res['fair_mult']:.2f}x)")
-            print(f" UNDER {res['line']:<4} Prob: {res['under_prob']:.2%}")
             print("=" * 70)
 
         elif choice == "2":
-            print(f"\n--- WEEK {current_week} NFL AUTOMATED PARLAY BUILDER (1,000,000 SIMS/PROP) ---")
+            print(f"\n--- WEEK {current_week} NFL AUTOMATED PARLAY BUILDER ---")
             try:
-                rate_in = float(input("Minimum Hit Rate % per leg (e.g., 75 for 75%): ").strip())
+                rate_in = float(input("Minimum Hit Rate % per leg (e.g., 75): ").strip() or "75")
                 min_hit_rate = rate_in / 100.0 if rate_in > 1 else rate_in
-                parlay_legs = int(input("Legs per parlay (e.g., 3 or 4): ").strip())
-                discount = float(input("Line Aggressiveness (1.0 = full avg, 0.85 = safer alt-line floor): ").strip())
-                skip_blowouts = input("Skip high Blowout-Risk games (including sneaky -2.5 traps)? [Y/n]: ").strip().lower() != "n"
+                parlay_legs = int(input("Legs per parlay (e.g., 3): ").strip() or "3")
+                discount = float(input("Line Aggressiveness (1.0 = full avg, 0.85 = alt floor): ").strip() or "0.85")
+                skip_blowouts = input("Skip high Blowout-Risk games? [Y/n]: ").strip().lower() != "n"
             except ValueError:
                 min_hit_rate, parlay_legs, discount, skip_blowouts = 0.75, 3, 0.85, True
 
-            t0 = time.time()
             recent_pool = reg_stats[
                 (reg_stats["season"] == current_season) & (reg_stats["week"] >= max(1, current_week - 3))
             ]
@@ -860,18 +1182,14 @@ def run_nfl_menu(nfl_ctx=None):
             )
 
             qualifying_legs = []
-            sims_count = 0
             for _, p in active_players.iterrows():
-                p_name = str(p["player_display_name"]).strip()
-                if p_name.lower() in out_players:
+                if str(p["player_display_name"]).strip().lower() in out_players:
                     continue
                 team, pos = p[team_col], p["position"]
                 if team not in matchup_map or pos not in pos_props:
                     continue
                 if skip_blowouts and matchup_map[team]["blowout_prob"] >= 0.35:
                     continue
-
-                opp = matchup_map[team]["opponent"]
                 p_logs = reg_stats[reg_stats["player_id"] == p["player_id"]].sort_values("sort_key")
                 if len(p_logs) < 4:
                     continue
@@ -883,250 +1201,93 @@ def run_nfl_menu(nfl_ctx=None):
                     raw_avg = healthy[stat_col].mean()
                     if (stat_col != "receptions" and raw_avg < 18) or (stat_col == "receptions" and raw_avg < 3.5):
                         continue
-                    target_line = np.floor(raw_avg * discount) + 0.5
-                    res = simulate_nfl_prop(nfl_ctx, p_logs, opp, stat_col, target_line)
-                    sims_count += N_SIMS
+                    res = simulate_nfl_prop(nfl_ctx, p_logs, matchup_map[team]["opponent"], stat_col, np.floor(raw_avg * discount) + 0.5)
                     if res["over_prob"] >= min_hit_rate:
                         qualifying_legs.append(res)
 
-            elapsed = time.time() - t0
-            qualifying_legs.sort(key=lambda x: (x["over_prob"] * (0.85 + 0.15 * x["consistency"])), reverse=True)
-            print(f"\nCompleted {sims_count:,} sims in {elapsed:.1f}s | Found {len(qualifying_legs)} legs >= {min_hit_rate:.0%}:")
+            qualifying_legs.sort(key=lambda x: x["over_prob"], reverse=True)
             for leg in qualifying_legs[:12]:
                 print(
-                    f"  [{leg['over_prob']:.2%} | Cons:{leg['consistency']:.0%}] {leg['player']} ({leg['team']}) "
-                    f"OVER {leg['line']} {leg['stat']} (Proj: {leg['proj']:.1f} | {leg['game']} | {leg['flags']})"
+                    f"  [{leg['over_prob']:.2%}] {leg['player']} ({leg['team']}) OVER {leg['line']} {leg['stat']} "
+                    f"(Proj: {leg['proj']:.1f} | {leg['game']} | {leg['flags']})"
                 )
-
-            if len(qualifying_legs) >= parlay_legs:
-                print(f"\n================ TOP {parlay_legs}-LEG NFL PARLAYS (1 LEG PER GAME) ================")
-                valid_parlays = []
-                for combo in itertools.combinations(qualifying_legs[:14], parlay_legs):
-                    if len({leg["game"] for leg in combo}) < parlay_legs:
-                        continue
-                    valid_parlays.append((float(np.prod([leg["over_prob"] for leg in combo])), combo))
-                valid_parlays.sort(key=lambda x: x[0], reverse=True)
-                for idx, (prob, combo) in enumerate(valid_parlays[:5], start=1):
-                    fair_odds = int(-100 * prob / (1 - prob)) if prob > 0.5 else int(100 * (1 - prob) / prob)
-                    print(f"\nParlay #{idx} | Combined Hit Prob: {prob:.2%} (Fair Odds: {fair_odds:+d})")
-                    for leg in combo:
-                        print(
-                            f"   -> {leg['player']} ({leg['team']}) OVER {leg['line']} {leg['stat']} "
-                            f"[{leg['over_prob']:.2%} | Proj: {leg['proj']:.1f} | {leg['game']}]"
-                        )
 
         elif choice == "3":
-            print(f"\n--- WEEK {current_week} NFL DFS LINEUP PROJECTOR & OPTIMIZER ($50,000 CAP) ---")
-            is_gpp = input("Contest Mode — [1] Cash (Median) or [2] GPP (Ceiling + QB Stack): ").strip() == "2"
+            print(f"\n--- PRO WEEK {current_week} NFL DFS OPTIMIZER ---")
+            site = "FD" if input("Site — [1] DraftKings ($50k) or [2] FanDuel ($60k): ").strip() == "2" else "DK"
+            mode_in = input("Contest Mode — [1] Cash (Median), [2] GPP (Ceiling), [3] Contrarian Leverage: ").strip()
+            mode = {"1": "cash", "2": "gpp", "3": "leverage"}.get(mode_in, "gpp")
+            num_lu = int(input("How many lineups to generate (1–20, default 3): ").strip() or "3")
+            stack_in = input("Stacking — [1] QB+1+BringBack, [2] QB+2+BringBack, [3] QB+1 Only: ").strip()
+            stack_type = {"1": "qb_1_bringback", "2": "qb_2_bringback", "3": "qb_1"}.get(stack_in, "qb_1_bringback")
+            lock_str = input("Lock players (comma-separated, or Enter for none): ").strip()
+            excl_str = input("Exclude players (comma-separated, or Enter for none): ").strip()
 
-            dk_salaries = {}
-            if os.path.exists("DKSalaries.csv"):
-                dk_df = pd.read_csv("DKSalaries.csv")
-                for _, row in dk_df.iterrows():
-                    dk_salaries[str(row.get("Name", "")).strip().lower()] = int(row.get("Salary", 5000))
+            locked = [x.strip() for x in lock_str.split(",") if x.strip()]
+            excluded = [x.strip() for x in excl_str.split(",") if x.strip()]
 
-            t0 = time.time()
-            recent_pool = reg_stats[
-                (reg_stats["season"] == current_season) & (reg_stats["week"] >= max(1, current_week - 3))
-            ]
-            active_players = recent_pool[["player_id", "player_display_name", "position", team_col]].drop_duplicates(
-                subset=["player_id"]
+            custom_df = pd.read_csv("DKSalaries.csv") if os.path.exists("DKSalaries.csv") else None
+            df_pool = build_nfl_dfs_pool(nfl_ctx, site=site, custom_csv_df=custom_df)
+            lineups = optimize_nfl_dfs_lineups(
+                df_pool, site=site, mode=mode, num_lineups=num_lu, stack_type=stack_type, locked_names=locked, excluded_names=excluded
             )
 
-            pool = []
-            for _, p in active_players.iterrows():
-                if str(p["player_display_name"]).strip().lower() in out_players:
-                    continue
-                team, pos = p[team_col], p["position"]
-                if team not in matchup_map or pos not in ["QB", "RB", "WR", "TE"]:
-                    continue
-                opp = matchup_map[team]["opponent"]
-                p_logs = reg_stats[reg_stats["player_id"] == p["player_id"]].sort_values("sort_key")
-                if len(p_logs) < 3 or p_logs["dk_points"].tail(6).mean() < 4.5:
-                    continue
-
-                res = simulate_nfl_prop(nfl_ctx, p_logs, opp, "dk_points", 15.0)
-                name_lower = res["player"].lower()
-                if name_lower in dk_salaries:
-                    salary = dk_salaries[name_lower]
-                else:
-                    base_sal = {
-                        "QB": 4600 + (res["proj"] * 175),
-                        "RB": 4000 + (res["proj"] * 240),
-                        "WR": 3500 + (res["proj"] * 235),
-                        "TE": 2800 + (res["proj"] * 245),
-                    }[pos]
-                    salary = int(np.clip(round(base_sal / 100) * 100, 3000, 9500))
-
-                pool.append(
-                    {
-                        "name": res["player"],
-                        "pos": pos,
-                        "team": team,
-                        "opp": opp,
-                        "salary": salary,
-                        "proj": res["proj"],
-                        "ceiling": res["ceiling"],
-                        "opt_pts": res["ceiling"] if is_gpp else res["proj"],
-                        "value": (res["proj"] / salary) * 1000,
-                    }
-                )
-
-            for team, info in matchup_map.items():
-                opp = info["opponent"]
-                opp_implied = (info["total_line"] / 2.0) + (info["team_spread"] / 2.0)
-                dst_proj = float(np.clip(13.5 - (opp_implied * 0.32), 3.0, 12.0))
-                dst_ceil = dst_proj + 5.5
-                dst_name = f"{team} DST"
-                sal = dk_salaries.get(
-                    dst_name.lower(), int(np.clip(round((2200 + dst_proj * 210) / 100) * 100, 2200, 4400))
-                )
-                pool.append(
-                    {
-                        "name": dst_name,
-                        "pos": "DST",
-                        "team": team,
-                        "opp": opp,
-                        "salary": sal,
-                        "proj": dst_proj,
-                        "ceiling": dst_ceil,
-                        "opt_pts": dst_ceil if is_gpp else dst_proj,
-                        "value": (dst_proj / sal) * 1000,
-                    }
-                )
-
-            df_pool = pd.DataFrame(pool)
-            n = len(df_pool)
-            constraints = [
-                LinearConstraint(df_pool["salary"].values, 0, 50000),
-                LinearConstraint((df_pool["pos"] == "QB").astype(float).values, 1, 1),
-                LinearConstraint((df_pool["pos"] == "DST").astype(float).values, 1, 1),
-                LinearConstraint((df_pool["pos"] == "RB").astype(float).values, 2, 3),
-                LinearConstraint((df_pool["pos"] == "WR").astype(float).values, 3, 4),
-                LinearConstraint((df_pool["pos"] == "TE").astype(float).values, 1, 2),
-                LinearConstraint(df_pool["pos"].isin(["RB", "WR", "TE"]).astype(float).values, 7, 7),
-            ]
-            if is_gpp:
-                for t in df_pool["team"].unique():
-                    qb_t = ((df_pool["team"] == t) & (df_pool["pos"] == "QB")).astype(float).values
-                    pc_t = ((df_pool["team"] == t) & (df_pool["pos"].isin(["WR", "TE"]))).astype(float).values
-                    constraints.append(LinearConstraint(pc_t - qb_t, 0, np.inf))
-
-            res_opt = milp(c=-df_pool["opt_pts"].values, integrality=np.ones(n), bounds=Bounds(0, 1), constraints=constraints)
-            elapsed = time.time() - t0
-            if not res_opt.success:
-                print("[!] Could not find a valid NFL DFS lineup under $50,000.")
-                continue
-
-            chosen = df_pool[res_opt.x > 0.5].copy()
-            chosen["order"] = chosen["pos"].map({"QB": 1, "RB": 2, "WR": 3, "TE": 4, "DST": 5})
-            chosen = chosen.sort_values(["order", "proj"], ascending=[True, False])
-
-            print("\n" + "=" * 78)
-            mode_label = "GPP TOURNAMENT (CEILING + QB STACK)" if is_gpp else "CASH GAME (MEDIAN PROJECTION)"
-            print(f" OPTIMAL WEEK {current_week} NFL DFS LINEUP | {mode_label} ({elapsed:.1f}s)")
-            print("=" * 78)
-            print(f" {'POS':<4} {'PLAYER':<22} {'MATCHUP':<11} {'SALARY':>7} {'MEDIAN':>7} {'CEIL':>7} {'VAL':>5}")
-            print("-" * 78)
-            counts = {"QB": 0, "RB": 0, "WR": 0, "TE": 0, "DST": 0}
-            limits = {"QB": 1, "RB": 2, "WR": 3, "TE": 1, "DST": 1}
-            for _, row in chosen.iterrows():
-                p = row["pos"]
-                counts[p] += 1
-                slot = "FLEX" if counts[p] > limits[p] else p
+            cap = 50000 if site == "DK" else 60000
+            for idx, lu in enumerate(lineups, start=1):
+                print("\n" + "=" * 86)
+                print(f" OPTIMAL {site} LINEUP #{idx} | MODE: {mode.upper()} | STACK: {stack_type.upper()}")
+                print("=" * 86)
+                print(f" {'SLOT':<5} {'PLAYER':<22} {'GAME':<12} {'SALARY':>7} {'MEDIAN':>7} {'CEIL':>7} {'OWN%':>6}")
+                print("-" * 86)
+                for _, r in lu.iterrows():
+                    print(
+                        f" {r['slot']:<5} {r['name']:<22} {r['game']:<12} "
+                        f"${r['salary']:>6,} {r['proj']:>7.1f} {r['ceiling']:>7.1f} {r['est_own']:>5.1f}%"
+                    )
+                print("-" * 86)
                 print(
-                    f" {slot:<4} {row['name']:<22} {row['team'] + ' vs ' + row['opp']:<11} "
-                    f"${row['salary']:>6,} {row['proj']:>7.1f} {row['ceiling']:>7.1f} {row['value']:>4.1f}x"
+                    f" SALARY: ${lu['salary'].sum():,} / ${cap:,}  |  PROJ: {lu['proj'].sum():.1f}  |  "
+                    f"CEIL: {lu['ceiling'].sum():.1f}  |  CUMULATIVE OWN: {lu['est_own'].sum():.1f}%"
                 )
-            print("-" * 78)
-            print(
-                f" TOTAL SALARY: ${chosen['salary'].sum():,} / $50,000  |  "
-                f"PROJ MEDIAN: {chosen['proj'].sum():.1f} pts  |  CEILING: {chosen['ceiling'].sum():.1f} pts"
-            )
-            print("=" * 78)
 
         elif choice == "4":
-            print(f"\n--- WEEK {current_week} NFL 2x–3x VALUE FINDER (30%–50% HIT RATE + 100/500 REPORT) ---")
-            try:
-                min_pct = float(input("Minimum Hit Rate % (default 30 for 30%): ").strip() or "30")
-                max_pct = float(input("Maximum Hit Rate % (default 50 for 50%): ").strip() or "50")
-                skip_blowouts = input("Filter out high Blowout-Risk games? [Y/n]: ").strip().lower() != "n"
-                min_prob = min_pct / 100.0 if min_pct > 1 else min_pct
-                max_prob = max_pct / 100.0 if max_pct > 1 else max_pct
-            except ValueError:
-                min_prob, max_prob, skip_blowouts = 0.30, 0.50, True
-
-            t0 = time.time()
+            print(f"\n--- WEEK {current_week} NFL 2x–3x VALUE FINDER ---")
+            min_prob, max_prob = 0.30, 0.50
             recent_pool = reg_stats[
                 (reg_stats["season"] == current_season) & (reg_stats["week"] >= max(1, current_week - 3))
             ]
-            active_nfl = recent_pool[["player_id", "player_display_name", "position", team_col]].drop_duplicates(
-                subset=["player_id"]
-            )
-
+            active_nfl = recent_pool[["player_id", "player_display_name", "position", team_col]].drop_duplicates(subset=["player_id"])
             nfl_props_ext = {
                 "QB": [("passing_yards", "attempts", 10)],
                 "RB": [("rushing_yards", "carries", 5), ("receiving_yards", "targets", 2)],
                 "WR": [("receiving_yards", "targets", 3), ("receptions", "targets", 3)],
                 "TE": [("receiving_yards", "targets", 2), ("receptions", "targets", 2)],
             }
-
             candidates = []
-            sims_count = 0
-            print("\nScanning Week matchups for 2x–3x alt-line upside plays...")
-
             for _, p in active_nfl.iterrows():
-                if str(p["player_display_name"]).strip().lower() in out_players:
-                    continue
                 team, pos = p[team_col], p["position"]
                 if team not in matchup_map or pos not in nfl_props_ext:
                     continue
-                if skip_blowouts and matchup_map[team]["blowout_prob"] >= 0.35:
-                    continue
-
-                opp = matchup_map[team]["opponent"]
                 p_logs = reg_stats[reg_stats["player_id"] == p["player_id"]].sort_values("sort_key")
                 if len(p_logs) < 4:
                     continue
-
                 for stat_col, vol_col, min_vol in nfl_props_ext[pos]:
                     healthy = p_logs[p_logs[vol_col] >= min_vol].tail(10)
                     if len(healthy) < 4:
                         continue
-
-                    recent_trend_avg = healthy[stat_col].tail(4).mean()
+                    rec_avg = healthy[stat_col].tail(4).mean()
                     two_yr_avg = healthy[stat_col].mean()
-                    if (stat_col != "receptions" and recent_trend_avg < 20) or (
-                        stat_col == "receptions" and recent_trend_avg < 3.5
-                    ):
+                    if (stat_col != "receptions" and rec_avg < 20) or (stat_col == "receptions" and rec_avg < 3.5):
                         continue
-
                     for mult in [1.15, 1.28]:
-                        alt_line = np.floor(recent_trend_avg * mult) + 0.5
-                        res = simulate_nfl_prop(nfl_ctx, p_logs, opp, stat_col, alt_line)
-                        sims_count += N_SIMS
-
+                        alt_line = np.floor(rec_avg * mult) + 0.5
+                        res = simulate_nfl_prop(nfl_ctx, p_logs, matchup_map[team]["opponent"], stat_col, alt_line)
                         if min_prob <= res["over_prob"] <= max_prob:
-                            trend_boost = recent_trend_avg / max(two_yr_avg, 1.0)
-                            res["trend_ratio"] = trend_boost
-                            res["value_score"] = float(
-                                res["over_prob"] * res["def_mult"] * res["script_mult"] * np.clip(trend_boost, 0.85, 1.30)
-                            )
+                            res["trend_ratio"] = rec_avg / max(two_yr_avg, 1.0)
+                            res["value_score"] = float(res["over_prob"] * res["def_mult"] * res["script_mult"])
                             candidates.append(res)
-
-            elapsed = time.time() - t0
             candidates.sort(key=lambda x: x["value_score"], reverse=True)
-            seen, top_plays = set(), []
-            for c in candidates:
-                key = (c["player"], c["stat"])
-                if key not in seen:
-                    seen.add(key)
-                    top_plays.append(c)
-
-            print(f"\nCompleted {sims_count:,} NFL simulations in {elapsed:.1f}s!")
-            display_2x_3x_report(
-                top_plays, min_prob, max_prob, "NFL", reg_stats, ["season", "week"], "player_display_name"
-            )
+            display_2x_3x_report(candidates[:10], min_prob, max_prob, "NFL", reg_stats, ["season", "week"], "player_display_name")
 
         elif choice == "5" or choice.lower() in ["back", "quit", "exit", "q"]:
             break
@@ -1152,212 +1313,89 @@ def run_nba_menu(nba_ctx=None):
         print("  [1] Single Player Prop Simulator (1,000,000 Sims)")
         print("  [2] Auto-Scan Today's NBA Matchups & Build Parlays (1,000,000 Sims/Prop)")
         print("  [3] NBA 2x–3x Value Finder (30%–50% Hit Rate + 100/500 Report)")
-        print("  [4] Change Slate Date (e.g., Tomorrow's Games)")
-        print("  [5] Switch Sport / Back to Main Menu")
-        choice = input("Select [1/2/3/4/5]: ").strip()
+        print("  [4] NBA DFS Lineup Optimizer ($50,000 Salary Cap)")
+        print("  [5] Change Slate Date (e.g., Tomorrow's Games)")
+        print("  [6] Switch Sport / Back to Main Menu")
+        choice = input("Select [1/2/3/4/5/6]: ").strip()
 
         if choice == "1":
-            print("\n--- NBA SINGLE PLAYER PROP SIMULATOR (1,000,000 SIMS) ---")
-            print("Stats: PTS, REB, AST, FG3M, STL, BLK, PRA, PR, PA, RA")
-            player = input("\nPlayer Name (e.g., Nikola Jokic, Jayson Tatum): ").strip()
+            player = input("\nPlayer Name (e.g., Nikola Jokic): ").strip()
             p_logs = nba_df[nba_df["PLAYER_NAME"].str.contains(player, case=False, na=False)]
             if p_logs.empty:
                 print(f"[!] No NBA player found matching '{player}'.")
                 continue
-
             team_abbr = p_logs.sort_values("GAME_DATE")["TEAM_ABBREVIATION"].iloc[-1]
             auto_opp = matchup_map[team_abbr]["opponent"] if team_abbr in matchup_map else ""
-            opp = (
-                input(f"Opponent Team Abbr [Press Enter for {nba_ctx['target_date']} opp: {auto_opp}]: ").strip().upper()
-                or auto_opp
-            )
-            stat = input("Stat (PTS, REB, AST, FG3M, PRA, PR, PA, RA): ").strip().upper()
-            if stat not in nba_df.columns:
-                print(f"[!] Invalid stat '{stat}'.")
-                continue
-            try:
-                line = float(input("Prop Line (e.g., 26.5): ").strip())
-            except ValueError:
-                print("[!] Invalid number for prop line.")
-                continue
-
-            star_out = input("Is a star teammate OUT tonight? [y/N]: ").strip().lower() == "y"
-            manual_bump = 1.07 if star_out else 1.0
-
-            t0 = time.time()
-            res = simulate_nba_prop(nba_ctx, p_logs, opp, stat, line, manual_bump=manual_bump)
-            elapsed = time.time() - t0
-
-            print("\n" + "=" * 70)
-            print(f" {res['player']} ({res['team']}) vs. {res['opponent']} | {res['stat']} {res['line']}")
-            print("=" * 70)
-            print(f" Sims Run:          {N_SIMS:,} (Completed in {elapsed:.2f}s)")
-            print(f" Healthy Games:     {res['games_used']} | Consistency Score: {res['consistency']:.0%}")
-            print(f" Matchup & Script:  {res['script_note']}")
-            print(f" Context Flags:     {res['flags']}")
-            print(f" Engine Breakdown:  {res['breakdown']} (Def: {res['def_mult']:.2f}x)")
-            print("-" * 70)
-            print(f" Median Projection: {res['proj']:.1f}  (Floor: {res['floor']:.1f} | Ceiling: {res['ceiling']:.1f})")
-            print(f" OVER {res['line']:<5} Prob: {res['over_prob']:.2%}  (Fair Payout: {res['fair_mult']:.2f}x)")
-            print(f" UNDER {res['line']:<4} Prob: {res['under_prob']:.2%}")
-            print("=" * 70)
+            opp = input(f"Opponent [Enter for {auto_opp}]: ").strip().upper() or auto_opp
+            stat = input("Stat (PTS, REB, AST, PRA, PR, PA, RA, FG3M): ").strip().upper()
+            line = float(input("Prop Line: ").strip())
+            res = simulate_nba_prop(nba_ctx, p_logs, opp, stat, line)
+            print(f"\n{res['player']} OVER {line} {stat} -> Median: {res['proj']:.1f} | Hit Prob: {res['over_prob']:.2%} | Flags: {res['flags']}")
 
         elif choice == "2":
-            print(f"\n--- {nba_ctx['target_date']} NBA AUTOMATED PARLAY BUILDER (1,000,000 SIMS/PROP) ---")
-            if not matchup_map:
-                print("[!] No NBA games scheduled for this date.")
-                continue
-            print("Games on Slate:")
-            for g in todays_games:
-                home_t = g.split("@")[-1].strip()
-                b_prob = matchup_map[home_t]["blowout_prob"]
-                s_tag = " [!] SNEAKY CLOSE-SPREAD BLOWOUT RISK" if matchup_map[home_t]["sneaky_blowout"] else ""
-                print(f"  • {g} (15+ pt Blowout Prob: {b_prob:.0%}{s_tag})")
-
-            try:
-                rate_in = float(input("\nMinimum Hit Rate % per leg (e.g., 75 for 75%): ").strip())
-                min_hit_rate = rate_in / 100.0 if rate_in > 1 else rate_in
-                parlay_legs = int(input("Legs per parlay (e.g., 3 or 4): ").strip())
-                discount = float(input("Line Aggressiveness (1.0 = full avg, 0.85 = safer alt-line floor): ").strip())
-                skip_blowouts = input("Skip high Blowout-Risk games (including sneaky -2.5 traps)? [Y/n]: ").strip().lower() != "n"
-            except ValueError:
-                min_hit_rate, parlay_legs, discount, skip_blowouts = 0.75, 3, 0.85, True
-
-            t0 = time.time()
             cutoff = nba_df["GAME_DATE"].max() - pd.Timedelta(days=14)
             active_ids = nba_df[nba_df["GAME_DATE"] >= cutoff]["PLAYER_ID"].unique()
-
-            qualifying_legs = []
-            sims_count = 0
+            legs = []
             for pid in active_ids:
                 p_logs = nba_df[nba_df["PLAYER_ID"] == pid].sort_values("GAME_DATE")
-                team = p_logs["TEAM_ABBREVIATION"].iloc[-1]
-                if team not in matchup_map or len(p_logs) < 5:
+                t = p_logs["TEAM_ABBREVIATION"].iloc[-1]
+                if t not in matchup_map or len(p_logs) < 5 or matchup_map[t]["blowout_prob"] >= 0.34:
                     continue
-                if skip_blowouts and matchup_map[team]["blowout_prob"] >= 0.34:
+                h = p_logs[p_logs["MIN"] >= 15.0].tail(12)
+                if len(h) < 5 or h["MIN"].mean() < 20.0:
                     continue
-
-                healthy = p_logs[p_logs["MIN"] >= 15.0].tail(12)
-                if len(healthy) < 5 or healthy["MIN"].mean() < 20.0:
-                    continue
-                opp = matchup_map[team]["opponent"]
-                for stat in ["PTS", "REB", "AST", "PRA"]:
-                    raw_avg = healthy[stat].mean()
-                    if (stat in ["REB", "AST"] and raw_avg < 4.5) or (stat == "PTS" and raw_avg < 10.0):
+                for st_col in ["PTS", "REB", "AST", "PRA"]:
+                    avg = h[st_col].mean()
+                    if (st_col in ["REB", "AST"] and avg < 4.5) or (st_col == "PTS" and avg < 10.0):
                         continue
-                    target_line = np.floor(raw_avg * discount) + 0.5
-                    res = simulate_nba_prop(nba_ctx, p_logs, opp, stat, target_line)
-                    sims_count += N_SIMS
-                    if res["over_prob"] >= min_hit_rate:
-                        qualifying_legs.append(res)
-
-            elapsed = time.time() - t0
-            qualifying_legs.sort(key=lambda x: (x["over_prob"] * (0.85 + 0.15 * x["consistency"])), reverse=True)
-            print(f"\nCompleted {sims_count:,} sims in {elapsed:.1f}s | Found {len(qualifying_legs)} legs >= {min_hit_rate:.0%}:")
-            for leg in qualifying_legs[:12]:
-                print(
-                    f"  [{leg['over_prob']:.2%} | Cons:{leg['consistency']:.0%}] {leg['player']} ({leg['team']}) "
-                    f"OVER {leg['line']} {leg['stat']} (Proj: {leg['proj']:.1f} | {leg['game']} | {leg['flags']})"
-                )
-
-            if len(qualifying_legs) >= parlay_legs:
-                print(f"\n================ TOP {parlay_legs}-LEG NBA PARLAYS (1 LEG PER GAME) ================")
-                valid_parlays = []
-                for combo in itertools.combinations(qualifying_legs[:14], parlay_legs):
-                    if len({leg["game"] for leg in combo}) < parlay_legs:
-                        continue
-                    valid_parlays.append((float(np.prod([leg["over_prob"] for leg in combo])), combo))
-                valid_parlays.sort(key=lambda x: x[0], reverse=True)
-                for idx, (prob, combo) in enumerate(valid_parlays[:5], start=1):
-                    fair_odds = int(-100 * prob / (1 - prob)) if prob > 0.5 else int(100 * (1 - prob) / prob)
-                    print(f"\nParlay #{idx} | Combined Hit Prob: {prob:.2%} (Fair Odds: {fair_odds:+d})")
-                    for leg in combo:
-                        print(
-                            f"   -> {leg['player']} ({leg['team']}) OVER {leg['line']} {leg['stat']} "
-                            f"[{leg['over_prob']:.2%} | Proj: {leg['proj']:.1f} | {leg['game']}]"
-                        )
+                    res = simulate_nba_prop(nba_ctx, p_logs, matchup_map[t]["opponent"], st_col, np.floor(avg * 0.85) + 0.5)
+                    if res["over_prob"] >= 0.75:
+                        legs.append(res)
+            legs.sort(key=lambda x: x["over_prob"], reverse=True)
+            for l in legs[:12]:
+                print(f"  [{l['over_prob']:.1%}] {l['player']} ({l['team']}) OVER {l['line']} {l['stat']} ({l['flags']})")
 
         elif choice == "3":
-            print(f"\n--- {nba_ctx['target_date']} NBA 2x–3x VALUE FINDER (30%–50% HIT RATE + 100/500 REPORT) ---")
-            if not matchup_map:
-                print("[!] No NBA games scheduled for this date.")
-                continue
-
-            try:
-                min_pct = float(input("Minimum Hit Rate % (default 30 for 30%): ").strip() or "30")
-                max_pct = float(input("Maximum Hit Rate % (default 50 for 50%): ").strip() or "50")
-                skip_blowouts = input("Filter out high Blowout-Risk games (including sneaky -2.5 traps)? [Y/n]: ").strip().lower() != "n"
-                min_prob = min_pct / 100.0 if min_pct > 1 else min_pct
-                max_prob = max_pct / 100.0 if max_pct > 1 else max_pct
-            except ValueError:
-                min_prob, max_prob, skip_blowouts = 0.30, 0.50, True
-
-            t0 = time.time()
             cutoff = nba_df["GAME_DATE"].max() - pd.Timedelta(days=14)
-            active_nba_ids = nba_df[nba_df["GAME_DATE"] >= cutoff]["PLAYER_ID"].unique()
-
-            candidates = []
-            sims_count = 0
-            print(f"\nScanning {len(todays_games)} NBA games for 2x–3x alt-line upside plays...")
-
-            for pid in active_nba_ids:
+            active_ids = nba_df[nba_df["GAME_DATE"] >= cutoff]["PLAYER_ID"].unique()
+            cands = []
+            for pid in active_ids:
                 p_logs = nba_df[nba_df["PLAYER_ID"] == pid].sort_values("GAME_DATE")
-                team = p_logs["TEAM_ABBREVIATION"].iloc[-1]
-                if team not in matchup_map or len(p_logs) < 5:
+                t = p_logs["TEAM_ABBREVIATION"].iloc[-1]
+                if t not in matchup_map or len(p_logs) < 5 or matchup_map[t]["blowout_prob"] >= 0.34:
                     continue
-                if skip_blowouts and matchup_map[team]["blowout_prob"] >= 0.34:
+                h = p_logs[p_logs["MIN"] >= 15.0].tail(12)
+                if len(h) < 5 or h["MIN"].mean() < 22.0:
                     continue
-
-                healthy = p_logs[p_logs["MIN"] >= 15.0].tail(12)
-                if len(healthy) < 5 or healthy["MIN"].mean() < 22.0:
-                    continue
-
-                opp = matchup_map[team]["opponent"]
-                for stat in ["PTS", "REB", "AST", "PRA"]:
-                    recent_trend_avg = healthy[stat].tail(5).mean()
-                    two_yr_avg = healthy[stat].mean()
-                    if (stat in ["REB", "AST"] and recent_trend_avg < 4.5) or (stat == "PTS" and recent_trend_avg < 11.0):
+                for st_col in ["PTS", "REB", "AST", "PRA"]:
+                    rec_avg = h[st_col].tail(5).mean()
+                    if (st_col in ["REB", "AST"] and rec_avg < 4.5) or (st_col == "PTS" and rec_avg < 11.0):
                         continue
-
-                    for mult in [1.12, 1.24]:
-                        alt_line = np.floor(recent_trend_avg * mult) + 0.5
-                        res = simulate_nba_prop(nba_ctx, p_logs, opp, stat, alt_line)
-                        sims_count += N_SIMS
-
-                        if min_prob <= res["over_prob"] <= max_prob:
-                            trend_boost = recent_trend_avg / max(two_yr_avg, 1.0)
-                            res["trend_ratio"] = trend_boost
-                            res["value_score"] = float(
-                                res["over_prob"] * res["def_mult"] * res["script_mult"] * np.clip(trend_boost, 0.85, 1.30)
-                            )
-                            candidates.append(res)
-
-            elapsed = time.time() - t0
-            candidates.sort(key=lambda x: x["value_score"], reverse=True)
-            seen, top_plays = set(), []
-            for c in candidates:
-                key = (c["player"], c["stat"])
-                if key not in seen:
-                    seen.add(key)
-                    top_plays.append(c)
-
-            print(f"\nCompleted {sims_count:,} NBA simulations in {elapsed:.1f}s!")
-            display_2x_3x_report(
-                top_plays, min_prob, max_prob, "NBA", nba_df, ["GAME_DATE"], "PLAYER_NAME"
-            )
+                    alt_line = np.floor(rec_avg * 1.15) + 0.5
+                    res = simulate_nba_prop(nba_ctx, p_logs, matchup_map[t]["opponent"], st_col, alt_line)
+                    if 0.30 <= res["over_prob"] <= 0.50:
+                        res["trend_ratio"] = rec_avg / max(h[st_col].mean(), 1.0)
+                        res["value_score"] = float(res["over_prob"] * res["def_mult"])
+                        cands.append(res)
+            cands.sort(key=lambda x: x["value_score"], reverse=True)
+            display_2x_3x_report(cands[:10], 0.30, 0.50, "NBA", nba_df, ["GAME_DATE"], "PLAYER_NAME")
 
         elif choice == "4":
-            new_date = input("Enter NBA Slate Date (YYYY-MM-DD, e.g. 2026-11-19): ").strip()
-            if new_date:
-                nba_ctx = build_nba_context(new_date)
-                nba_df = nba_ctx["nba_df"]
-                matchup_map = nba_ctx["matchup_map"]
-                todays_games = nba_ctx["todays_games"]
+            df_pool = build_nba_dfs_pool(nba_ctx)
+            lineups = optimize_nba_dfs_lineups(df_pool, mode="gpp", num_lineups=3)
+            for idx, lu in enumerate(lineups, start=1):
+                print(f"\n=== OPTIMAL NBA DFS LINEUP #{idx} (Salary: ${lu['salary'].sum():,} | Proj: {lu['proj'].sum():.1f}) ===")
+                for _, r in lu.iterrows():
+                    print(f"  {r['slot']:<5} {r['name']:<22} ({r['team']}) ${r['salary']:>6,} | Proj: {r['proj']:>5.1f} | Ceil: {r['ceiling']:>5.1f}")
 
-        elif choice == "5" or choice.lower() in ["back", "quit", "exit", "q"]:
+        elif choice == "5":
+            nd = input("Enter NBA Slate Date (YYYY-MM-DD): ").strip()
+            if nd:
+                nba_ctx = build_nba_context(nd)
+                nba_df, matchup_map, todays_games = nba_ctx["nba_df"], nba_ctx["matchup_map"], nba_ctx["todays_games"]
+
+        elif choice == "6" or choice.lower() in ["back", "quit", "exit", "q"]:
             break
-        else:
-            print("Invalid choice. Enter 1, 2, 3, 4, or 5.")
 
     return nba_ctx
 
@@ -1367,16 +1405,16 @@ def run_nba_menu(nba_ctx=None):
 # =====================================================================
 if __name__ == "__main__":
     print("=================================================================")
-    print("   MULTI-SPORT 1,000,000-SIM PROP, PARLAY & VALUE ENGINE         ")
+    print("   MULTI-SPORT 1,000,000-SIM PROP, DFS & VALUE ENGINE            ")
     print("=================================================================")
     cached_nfl = None
     cached_nba = None
 
     while True:
         print("\nSelect a Sport:")
-        print("  [1] NFL (Props, Parlays, DFS Optimizer & 2x–3x Value Finder)")
-        print("  [2] NBA (Props, Parlays & 2x–3x Value Finder)")
-        print("  [3] College Sports (Men's CBB Props & College Football Spreads)")
+        print("  [1] NFL (Props, Parlays, Pro DFS Optimizer & 2x–3x Value Finder)")
+        print("  [2] NBA (Props, Parlays, NBA DFS Optimizer & 2x–3x Value Finder)")
+        print("  [3] College Sports (Men's CBB Props/Spreads/Upsets & CFB Spreads)")
         print("  [4] Quit")
         sport = input("Select [1/2/3/4]: ").strip()
 
@@ -1388,7 +1426,7 @@ if __name__ == "__main__":
             if os.path.exists("college_simulator.py"):
                 subprocess.run([sys.executable, "college_simulator.py"])
             else:
-                print("[!] college_simulator.py not found in this folder yet. Create it first!")
+                print("[!] college_simulator.py not found in this folder.")
         elif sport == "4" or sport.lower() in ["quit", "exit", "q"]:
             break
         else:
