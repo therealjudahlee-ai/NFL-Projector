@@ -16,6 +16,40 @@ st.title("📊 1,000,000-Sim Multi-Sport Prop, Spread & Pro DFS Engine")
 st.caption("NFL • NBA • Men's College Basketball • College Football | Recency-Weighted + Sneaky Blowout Protection")
 
 
+def ensure_nba_dk_pts(df):
+    """Guarantees DK_PTS exists on cached NBA DataFrames."""
+    if "DK_PTS" in df.columns:
+        return df
+    df = df.copy()
+    pts = df["PTS"] if "PTS" in df.columns else 0
+    reb = df["REB"] if "REB" in df.columns else 0
+    ast = df["AST"] if "AST" in df.columns else 0
+    fg3m = df["FG3M"] if "FG3M" in df.columns else 0
+    stl = df["STL"] if "STL" in df.columns else 0
+    blk = df["BLK"] if "BLK" in df.columns else 0
+    tov = df["TOV"] if "TOV" in df.columns else 0
+
+    dd = (
+        (pts >= 10).astype(int)
+        + (reb >= 10).astype(int)
+        + (ast >= 10).astype(int)
+        + (stl >= 10).astype(int)
+        + (blk >= 10).astype(int)
+    )
+    df["DK_PTS"] = (
+        pts * 1.0
+        + fg3m * 0.5
+        + reb * 1.25
+        + ast * 1.5
+        + stl * 2.0
+        + blk * 2.0
+        - tov * 0.5
+        + np.where(dd >= 2, 1.5, 0.0)
+        + np.where(dd >= 3, 3.0, 0.0)
+    )
+    return df
+
+
 @st.cache_resource(show_spinner="Loading NFL 2-year stats, weather & injuries...")
 def get_nfl():
     return pro_sim.build_nfl_context()
@@ -23,7 +57,9 @@ def get_nfl():
 
 @st.cache_resource(show_spinner="Loading NBA 2-year stats & live slate...")
 def get_nba(date_str):
-    return pro_sim.build_nba_context(date_str)
+    ctx = pro_sim.build_nba_context(date_str)
+    ctx["nba_df"] = ensure_nba_dk_pts(ctx["nba_df"])
+    return ctx
 
 
 @st.cache_resource(show_spinner="Loading Men's CBB 2-year stats & D1 slate...")
@@ -246,7 +282,6 @@ if sport_tab == "🏈 NFL":
                         disp = lu[["slot", "name", "pos", "team", "game", "salary", "proj", "ceiling", "est_own", "value", "flags"]]
                         st.dataframe(disp, use_container_width=True, hide_index=True)
 
-                        # Build DraftKings CSV upload row (QB, RB, RB, WR, WR, WR, TE, FLEX, DST)
                         qbs = lu[lu["pos"] == "QB"]["dk_id"].tolist()
                         rbs = lu[lu["slot"] == "RB"]["dk_id"].tolist()
                         wrs = lu[lu["slot"] == "WR"]["dk_id"].tolist()
@@ -278,6 +313,7 @@ if sport_tab == "🏈 NFL":
 elif sport_tab == "🏀 NBA":
     slate_date = st.sidebar.date_input("NBA Slate Date", value=datetime.now()).strftime("%Y-%m-%d")
     ctx = get_nba(slate_date)
+    ctx["nba_df"] = ensure_nba_dk_pts(ctx["nba_df"])
     nba_df = ctx["nba_df"]
     matchup_map = ctx["matchup_map"]
 
