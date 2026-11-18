@@ -7,12 +7,12 @@ import college_simulator as col_sim
 import prop_simulator as pro_sim
 
 st.set_page_config(
-    page_title="1M-Sim Multi-Sport Projector",
+    page_title="1M-Sim Multi-Sport Projector & DFS Optimizer",
     page_icon="📊",
     layout="wide",
 )
 
-st.title("📊 1,000,000-Sim Multi-Sport Prop, Spread & Parlay Engine")
+st.title("📊 1,000,000-Sim Multi-Sport Prop, Spread & Pro DFS Engine")
 st.caption("NFL • NBA • Men's College Basketball • College Football | Recency-Weighted + Sneaky Blowout Protection")
 
 
@@ -51,7 +51,12 @@ if sport_tab == "🏈 NFL":
     matchup_map = ctx["matchup_map"]
 
     st.subheader(f"NFL Season {ctx['season']} — Week {ctx['week']}")
-    mode = st.tabs(["Single Player Prop", "Auto Parlay Builder", "2x–3x Value Finder (100/500 Report)"])
+    mode = st.tabs([
+        "Single Player Prop",
+        "Auto Parlay Builder",
+        "2x–3x Value Finder (100/500 Report)",
+        "🏆 Pro NFL DFS Optimizer",
+    ])
 
     with mode[0]:
         col1, col2, col3, col4 = st.columns(4)
@@ -178,6 +183,95 @@ if sport_tab == "🏈 NFL":
             else:
                 st.warning("No NFL props matched that 30%–50% window.")
 
+    with mode[3]:
+        st.markdown("### 🏆 Pro NFL DFS Lineup Builder (Stacking, Bring-Backs, Leverage & Multi-Lineup)")
+        uploaded_csv = st.file_uploader("Optional: Upload DraftKings / FanDuel Salaries CSV", type=["csv"], key="nfl_csv")
+        custom_df = pd.read_csv(uploaded_csv) if uploaded_csv is not None else None
+
+        c1, c2, c3, c4 = st.columns(4)
+        dfs_site = c1.selectbox("DFS Site", ["DraftKings ($50k)", "FanDuel ($60k)"])
+        site_code = "DK" if "DraftKings" in dfs_site else "FD"
+        dfs_mode = c2.selectbox("Optimization Objective", ["GPP (80th Ceiling)", "Contrarian Leverage", "Cash (Median)"])
+        mode_code = {"GPP (80th Ceiling)": "gpp", "Contrarian Leverage": "leverage", "Cash (Median)": "cash"}[dfs_mode]
+        stack_choice = c3.selectbox(
+            "Correlation Stack Rule",
+            ["QB + 1 Pass Catcher + Opp Bring-Back", "QB + 2 Pass Catchers + Opp Bring-Back", "QB + 1 Pass Catcher Only", "No Stack"],
+        )
+        stack_code = {
+            "QB + 1 Pass Catcher + Opp Bring-Back": "qb_1_bringback",
+            "QB + 2 Pass Catchers + Opp Bring-Back": "qb_2_bringback",
+            "QB + 1 Pass Catcher Only": "qb_1",
+            "No Stack": "none",
+        }[stack_choice]
+        num_lu = c4.slider("Lineups to Generate", 1, 20, 3)
+
+        c5, c6, c7, c8 = st.columns(4)
+        min_uniq = c5.slider("Min Unique Players / Lineup", 1, 5, 2)
+        max_exp = c6.slider("Max Player Exposure %", 20, 100, 65) / 100.0
+        no_opp_dst = c7.checkbox("Block Opposing Players vs DST", value=True)
+        one_rb = c8.checkbox("Max 1 RB per Team", value=True)
+
+        df_pool = pro_sim.build_nfl_dfs_pool(ctx, site=site_code, custom_csv_df=custom_df)
+        if not df_pool.empty:
+            all_names = sorted(df_pool["name"].tolist())
+            lc1, lc2 = st.columns(2)
+            locked = lc1.multiselect("🔒 Lock Core Players", all_names)
+            excluded = lc2.multiselect("🚫 Exclude Players", [n for n in all_names if n not in locked])
+
+            if st.button("Generate Optimal NFL DFS Lineups", key="run_nfl_dfs"):
+                lineups = pro_sim.optimize_nfl_dfs_lineups(
+                    df_pool,
+                    site=site_code,
+                    mode=mode_code,
+                    num_lineups=num_lu,
+                    min_unique=min_uniq,
+                    max_exposure=max_exp,
+                    stack_type=stack_code,
+                    no_opp_vs_dst=no_opp_dst,
+                    max_1_rb_per_team=one_rb,
+                    locked_names=locked,
+                    excluded_names=excluded,
+                )
+                if not lineups:
+                    st.error("No valid lineups found with current Lock/Stack constraints. Try relaxing a lock or stack rule.")
+                else:
+                    cap = 50000 if site_code == "DK" else 60000
+                    export_rows = []
+                    for idx, lu in enumerate(lineups, start=1):
+                        st.markdown(
+                            f"**Lineup #{idx}** — Salary: `${lu['salary'].sum():,} / ${cap:,}` | "
+                            f"Median: `{lu['proj'].sum():.1f} pts` | Ceiling: `{lu['ceiling'].sum():.1f} pts` | "
+                            f"Cumulative Own: `{lu['est_own'].sum():.1f}%`"
+                        )
+                        disp = lu[["slot", "name", "pos", "team", "game", "salary", "proj", "ceiling", "est_own", "value", "flags"]]
+                        st.dataframe(disp, use_container_width=True, hide_index=True)
+
+                        # Build DraftKings CSV upload row (QB, RB, RB, WR, WR, WR, TE, FLEX, DST)
+                        qbs = lu[lu["pos"] == "QB"]["dk_id"].tolist()
+                        rbs = lu[lu["slot"] == "RB"]["dk_id"].tolist()
+                        wrs = lu[lu["slot"] == "WR"]["dk_id"].tolist()
+                        tes = lu[lu["slot"] == "TE"]["dk_id"].tolist()
+                        flx = lu[lu["slot"] == "FLEX"]["dk_id"].tolist()
+                        dsts = lu[lu["pos"] == "DST"]["dk_id"].tolist()
+                        if len(qbs) == 1 and len(rbs) == 2 and len(wrs) == 3 and len(tes) == 1 and len(flx) == 1 and len(dsts) == 1:
+                            export_rows.append({
+                                "QB": qbs[0], "RB": rbs[0], "RB.1": rbs[1],
+                                "WR": wrs[0], "WR.1": wrs[1], "WR.2": wrs[2],
+                                "TE": tes[0], "FLEX": flx[0], "DST": dsts[0],
+                            })
+
+                    if export_rows:
+                        csv_bytes = pd.DataFrame(export_rows).to_csv(index=False).encode("utf-8")
+                        st.download_button(
+                            "⬇️ Download DraftKings Upload CSV",
+                            data=csv_bytes,
+                            file_name=f"DK_NFL_Week{ctx['week']}_Lineups.csv",
+                            mime="text/csv",
+                        )
+
+            with st.expander("📋 View Full Projected Player Pool, Ownership & Leverage"):
+                st.dataframe(df_pool.sort_values("leverage", ascending=False), use_container_width=True, hide_index=True)
+
 # =====================================================================
 #                             NBA WEB TAB
 # =====================================================================
@@ -188,12 +282,17 @@ elif sport_tab == "🏀 NBA":
     matchup_map = ctx["matchup_map"]
 
     st.subheader(f"NBA Season {ctx['curr_szn']} — {slate_date} ({len(ctx['todays_games'])} Games)")
-    mode = st.tabs(["Single Player Prop", "Auto Parlay Builder", "2x–3x Value Finder (100/500 Report)"])
+    mode = st.tabs([
+        "Single Player Prop",
+        "Auto Parlay Builder",
+        "2x–3x Value Finder (100/500 Report)",
+        "🏆 NBA DFS Optimizer ($50k)",
+    ])
 
     with mode[0]:
         c1, c2, c3, c4 = st.columns(4)
         player_in = c1.text_input("Player Name", value="Nikola Jokic")
-        stat_in = c2.selectbox("Stat", ["PTS", "REB", "AST", "PRA", "PR", "PA", "RA", "FG3M", "STL", "BLK"])
+        stat_in = c2.selectbox("Stat", ["PTS", "REB", "AST", "PRA", "PR", "PA", "RA", "FG3M", "STL", "BLK", "DK_PTS"])
         line_in = c3.number_input("Prop Line", value=26.5, step=0.5)
         star_out = c4.checkbox("Star Teammate OUT (+7% Usage)")
 
@@ -294,6 +393,42 @@ elif sport_tab == "🏀 NBA":
                 st.dataframe(pd.DataFrame(rows), use_container_width=True)
             else:
                 st.warning("No NBA props matched that 30%–50% window.")
+
+    with mode[3]:
+        st.markdown("### 🏆 NBA DFS Lineup Builder (8-Player Roster under $50,000)")
+        nba_csv = st.file_uploader("Optional: Upload DraftKings NBA Salaries CSV", type=["csv"], key="nba_csv")
+        nba_custom_df = pd.read_csv(nba_csv) if nba_csv is not None else None
+
+        c1, c2, c3, c4 = st.columns(4)
+        nba_dfs_mode = c1.selectbox("Objective", ["GPP (80th Ceiling)", "Contrarian Leverage", "Cash (Median)"], key="nba_dfs_m")
+        m_code = {"GPP (80th Ceiling)": "gpp", "Contrarian Leverage": "leverage", "Cash (Median)": "cash"}[nba_dfs_mode]
+        nba_num_lu = c2.slider("Lineups to Generate", 1, 15, 3, key="nba_dfs_n")
+        nba_min_u = c3.slider("Min Unique Players", 1, 4, 2, key="nba_dfs_u")
+        nba_max_e = c4.slider("Max Exposure %", 25, 100, 65, key="nba_dfs_e") / 100.0
+
+        nba_pool = pro_sim.build_nba_dfs_pool(ctx, custom_csv_df=nba_custom_df)
+        if not nba_pool.empty:
+            nba_names = sorted(nba_pool["name"].tolist())
+            lc1, lc2 = st.columns(2)
+            nba_locked = lc1.multiselect("🔒 Lock NBA Core", nba_names)
+            nba_excl = lc2.multiselect("🚫 Exclude NBA Players", [n for n in nba_names if n not in nba_locked])
+
+            if st.button("Generate Optimal NBA DFS Lineups", key="run_nba_dfs"):
+                lus = pro_sim.optimize_nba_dfs_lineups(
+                    nba_pool,
+                    mode=m_code,
+                    num_lineups=nba_num_lu,
+                    min_unique=nba_min_u,
+                    max_exposure=nba_max_e,
+                    locked_names=nba_locked,
+                    excluded_names=nba_excl,
+                )
+                for idx, lu in enumerate(lus, start=1):
+                    st.markdown(
+                        f"**NBA Lineup #{idx}** — Salary: `${lu['salary'].sum():,} / $50,000` | "
+                        f"Median DK Pts: `{lu['proj'].sum():.1f}` | Ceiling: `{lu['ceiling'].sum():.1f}`"
+                    )
+                    st.dataframe(lu[["slot", "name", "team", "game", "salary", "proj", "ceiling", "est_own", "value", "flags"]], use_container_width=True, hide_index=True)
 
 # =====================================================================
 #                     MEN'S COLLEGE BASKETBALL TAB
