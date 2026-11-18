@@ -24,6 +24,85 @@ def _norm_name(name):
     return s
 
 
+def fetch_live_dk_salaries(sport="NFL"):
+    """Fetches live DraftKings main-slate salaries from DK's public lobby & draftables endpoints."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    salaries, dk_ids, slate_players = {}, {}, set()
+    try:
+        lobby_url = f"https://www.draftkings.com/lobby/getcontests?sport={sport}"
+        lobby = requests.get(lobby_url, headers=headers, timeout=8).json()
+        draft_groups = lobby.get("DraftGroups", [])
+        if not draft_groups:
+            return salaries, dk_ids, slate_players
+
+        classic_groups = [
+            dg for dg in draft_groups
+            if str(dg.get("ContestTypeId", "")) in ["21", "70", ""] and dg.get("GameCount", 0) >= 2
+        ] or draft_groups
+        main_dg = max(classic_groups, key=lambda x: x.get("GameCount", 0))
+        dg_id = main_dg.get("DraftGroupId")
+        if not dg_id:
+            return salaries, dk_ids, slate_players
+
+        draftables_url = f"https://api.draftkings.com/draftgroups/v1/draftgroups/{dg_id}/draftables"
+        d_data = requests.get(draftables_url, headers=headers, timeout=8).json()
+        for item in d_data.get("draftables", []):
+            disp_name = str(item.get("displayName", "")).strip()
+            sal = item.get("salary")
+            dk_id = item.get("draftableId")
+            team_abbr = str(item.get("teamAbbreviation", "")).strip()
+            pos = str(item.get("position", "")).strip()
+            if disp_name and sal:
+                norm = _norm_name(disp_name)
+                salaries[norm] = int(sal)
+                dk_ids[norm] = f"{disp_name} ({dk_id})" if dk_id else disp_name
+                slate_players.add(norm)
+                if pos == "DST" and team_abbr:
+                    t_norm = _norm_name(team_abbr)
+                    dst_norm = _norm_name(f"{team_abbr} DST")
+                    salaries[t_norm] = int(sal)
+                    salaries[dst_norm] = int(sal)
+                    dk_ids[dst_norm] = f"{disp_name} ({dk_id})" if dk_id else disp_name
+                    slate_players.update({t_norm, dst_norm})
+    except Exception:
+        pass
+    return salaries, dk_ids, slate_players
+
+
+def _parse_uploaded_dfs_csv(custom_csv_df):
+    """Parses both DraftKings ('Name') and FanDuel ('Nickname'/'First Name'+'Last Name') CSVs."""
+    csv_salaries, csv_ids = {}, {}
+    if custom_csv_df is None or custom_csv_df.empty:
+        return csv_salaries, csv_ids
+
+    for _, row in custom_csv_df.iterrows():
+        nm = str(row.get("Name", row.get("Nickname", ""))).strip()
+        if (not nm or nm.lower() == "nan") and "First Name" in row and "Last Name" in row:
+            nm = f"{row['First Name']} {row['Last Name']}".strip()
+        if not nm or nm.lower() == "nan":
+            continue
+
+        norm_nm = _norm_name(nm)
+        sal_val = int(pd.to_numeric(row.get("Salary", 5000), errors="coerce") or 5000)
+        csv_salaries[norm_nm] = sal_val
+
+        if "Name + ID" in row and pd.notna(row["Name + ID"]):
+            csv_ids[norm_nm] = str(row["Name + ID"])
+        elif "Id" in row and pd.notna(row["Id"]):
+            csv_ids[norm_nm] = f"{nm} ({row['Id']})"
+        else:
+            csv_ids[norm_nm] = nm
+
+        pos_val = str(row.get("Position", "")).strip().upper()
+        team_val = str(row.get("TeamAbbrev", row.get("Team", ""))).strip()
+        if pos_val in ["D", "DST", "DEF"] and team_val:
+            csv_salaries[_norm_name(team_val)] = sal_val
+            csv_salaries[_norm_name(f"{team_val} DST")] = sal_val
+            csv_ids[_norm_name(f"{team_val} DST")] = csv_ids[norm_nm]
+
+    return csv_salaries, csv_ids
+
+
 # =====================================================================
 #                   RECENCY-WEIGHTED 100 / 500 REPORT
 # =====================================================================
@@ -186,7 +265,7 @@ def build_nfl_context():
     except Exception:
         pass
 
-    # 3. Pull LIVE ESPN NFL injuries & 32-team active rosters (catches IR like Malik Willis immediately)
+    # 3. Pull LIVE ESPN NFL injuries & 32-team active rosters
     espn_abbr_map = {"WSH": "WAS", "LAR": "LA"}
     try:
         espn_inj = requests.get(
@@ -480,7 +559,7 @@ def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manua
 #             ADVANCED NFL DFS POOL & MULTI-LINEUP SOLVER
 # =====================================================================
 def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
-    """Builds a projected NFL DFS player pool with live ESPN IR/Roster filtering & 1-QB-per-team."""
+    """Builds a projected NFL DFS player pool with live DK/CSV prices & IR/Injury filtering."""
     reg_stats = nfl_ctx["reg_stats"]
     team_col = nfl_ctx["team_col"]
     matchup_map = nfl_ctx["matchup_map"]
@@ -489,18 +568,14 @@ def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
     active_roster_team = nfl_ctx.get("active_roster_team", {})
     stat_col = "dk_points" if site == "DK" else "fd_points"
 
-    csv_salaries = {}
-    csv_ids = {}
-    if custom_csv_df is not None and not custom_csv_df.empty:
-        for _, row in custom_csv_df.iterrows():
-            nm = str(row.get("Name", row.get("Nickname", ""))).strip()
-            if nm:
-                norm_nm = _norm_name(nm)
-                csv_salaries[norm_nm] = int(pd.to_numeric(row.get("Salary", 5000), errors="coerce") or 5000)
-                if "Name + ID" in row:
-                    csv_ids[norm_nm] = str(row["Name + ID"])
-                elif "Id" in row:
-                    csv_ids[norm_nm] = f"{nm} ({row['Id']})"
+    csv_salaries, csv_ids = _parse_uploaded_dfs_csv(custom_csv_df)
+    salary_source = f"Uploaded {site} CSV (Exact Prices)" if csv_salaries else "Estimated Model Prices (Upload CSV for Exact Slate Prices)"
+
+    if not csv_salaries and site == "DK":
+        live_sals, live_ids, _ = fetch_live_dk_salaries("NFL")
+        if live_sals:
+            csv_salaries, csv_ids = live_sals, live_ids
+            salary_source = "Live DraftKings Main Slate (Exact Prices)"
 
     recent_pool = reg_stats[
         (reg_stats["season"] == nfl_ctx["season"]) & (reg_stats["week"] >= max(1, nfl_ctx["week"] - 4))
@@ -516,7 +591,6 @@ def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
         if p_norm in out_players:
             continue
 
-        # Sync to live active roster team if available (blocks IR/PUP/inactive players)
         if active_roster_team:
             if p_norm not in active_roster_team:
                 continue
@@ -532,7 +606,6 @@ def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
         if len(p_logs) < 3:
             continue
 
-        # Require starter-level passing volume (20+ pass att/game) AND activity last week
         if pos == "QB":
             recent_att = p_logs["attempts"].tail(4).mean() if "attempts" in p_logs.columns else 0
             szn_logs = p_logs[p_logs["season"] == nfl_ctx["season"]]
@@ -589,11 +662,11 @@ def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
                 "leverage": round(leverage_pts, 2),
                 "value": round(val, 2),
                 "flags": res["flags"],
+                "salary_source": salary_source,
                 "_is_dc_qb1": 1 if (pos == "QB" and p_norm in starting_qbs) else 0,
             }
         )
 
-    # Strictly keep ONLY 1 true starting QB per NFL team
     df_temp = pd.DataFrame(pool)
     if not df_temp.empty and "QB" in df_temp["pos"].values:
         qbs = df_temp[df_temp["pos"] == "QB"].sort_values(["_is_dc_qb1", "proj"], ascending=[False, False])
@@ -639,6 +712,7 @@ def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
                 "leverage": round(dst_ceil * (1.0 - (est_own / 100.0) * 0.45), 2),
                 "value": round(val, 2),
                 "flags": f"Opp Implied: {opp_implied:.1f}",
+                "salary_source": salary_source,
             }
         )
 
@@ -1105,16 +1179,17 @@ def simulate_nba_prop(ctx, p_logs, opponent_abbr, stat_col, prop_line=0.0, manua
 
 
 def build_nba_dfs_pool(nba_ctx, custom_csv_df=None):
-    """Builds projected DraftKings NBA DFS pool (8-man roster under $50,000)."""
+    """Builds projected DraftKings NBA DFS pool with live DK/CSV salaries."""
     nba_df = _ensure_nba_dk_pts(nba_ctx["nba_df"])
     matchup_map = nba_ctx["matchup_map"]
 
-    csv_salaries = {}
-    if custom_csv_df is not None and not custom_csv_df.empty:
-        for _, row in custom_csv_df.iterrows():
-            nm = str(row.get("Name", "")).strip()
-            if nm:
-                csv_salaries[_norm_name(nm)] = int(pd.to_numeric(row.get("Salary", 5000), errors="coerce") or 5000)
+    csv_salaries, _ = _parse_uploaded_dfs_csv(custom_csv_df)
+    salary_source = "Uploaded CSV (Exact Prices)" if csv_salaries else "Estimated Model Prices (Upload CSV for Exact Slate Prices)"
+    if not csv_salaries:
+        live_sals, _, _ = fetch_live_dk_salaries("NBA")
+        if live_sals:
+            csv_salaries = live_sals
+            salary_source = "Live DraftKings Main Slate (Exact Prices)"
 
     cutoff = nba_df["GAME_DATE"].max() - pd.Timedelta(days=14)
     active_ids = nba_df[nba_df["GAME_DATE"] >= cutoff]["PLAYER_ID"].unique()
@@ -1149,6 +1224,7 @@ def build_nba_dfs_pool(nba_ctx, custom_csv_df=None):
             "leverage": round(res["ceiling"] * (1.0 - (est_own / 100.0) * 0.45), 2),
             "value": round(val, 2),
             "flags": res["flags"],
+            "salary_source": salary_source,
         })
     return pd.DataFrame(pool)
 
