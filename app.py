@@ -248,13 +248,18 @@ if sport_tab == "🏈 NFL":
         one_rb = c8.checkbox("Max 1 RB per Team", value=True)
 
         df_pool = pro_sim.build_nfl_dfs_pool(ctx, site=site_code, custom_csv_df=custom_df)
-        if not df_pool.empty:
-            all_names = sorted(df_pool["name"].tolist())
-            lc1, lc2 = st.columns(2)
-            locked = lc1.multiselect("🔒 Lock Core Players", all_names)
-            excluded = lc2.multiselect("🚫 Exclude Players", [n for n in all_names if n not in locked])
+        all_names = sorted(df_pool["name"].tolist()) if not df_pool.empty else []
 
-            if st.button("Generate Optimal NFL DFS Lineups", key="run_nfl_dfs"):
+        lc1, lc2 = st.columns(2)
+        locked = lc1.multiselect("🔒 Lock Core Players", all_names, key="nfl_lock")
+        excluded = lc2.multiselect("🚫 Exclude Players", [n for n in all_names if n not in locked], key="nfl_excl")
+
+        st.caption(f"Player Pool Loaded: **{len(df_pool)}** players across **{len(matchup_map) // 2}** Week {ctx['week']} games.")
+
+        if st.button("🚀 Generate Optimal NFL DFS Lineups", key="run_nfl_dfs", type="primary"):
+            if df_pool.empty:
+                st.warning("No NFL players in pool for this week's slate (or uploaded CSV names didn't match).")
+            else:
                 lineups = pro_sim.optimize_nfl_dfs_lineups(
                     df_pool,
                     site=site_code,
@@ -304,6 +309,7 @@ if sport_tab == "🏈 NFL":
                             mime="text/csv",
                         )
 
+        if not df_pool.empty:
             with st.expander("📋 View Full Projected Player Pool, Ownership & Leverage"):
                 st.dataframe(df_pool.sort_values("leverage", ascending=False), use_container_width=True, hide_index=True)
 
@@ -443,13 +449,18 @@ elif sport_tab == "🏀 NBA":
         nba_max_e = c4.slider("Max Exposure %", 25, 100, 65, key="nba_dfs_e") / 100.0
 
         nba_pool = pro_sim.build_nba_dfs_pool(ctx, custom_csv_df=nba_custom_df)
-        if not nba_pool.empty:
-            nba_names = sorted(nba_pool["name"].tolist())
-            lc1, lc2 = st.columns(2)
-            nba_locked = lc1.multiselect("🔒 Lock NBA Core", nba_names)
-            nba_excl = lc2.multiselect("🚫 Exclude NBA Players", [n for n in nba_names if n not in nba_locked])
+        nba_names = sorted(nba_pool["name"].tolist()) if not nba_pool.empty else []
 
-            if st.button("Generate Optimal NBA DFS Lineups", key="run_nba_dfs"):
+        lc1, lc2 = st.columns(2)
+        nba_locked = lc1.multiselect("🔒 Lock NBA Core", nba_names, key="nba_lock")
+        nba_excl = lc2.multiselect("🚫 Exclude NBA Players", [n for n in nba_names if n not in nba_locked], key="nba_excl")
+
+        st.caption(f"NBA Pool Loaded: **{len(nba_pool)}** players across **{len(ctx['todays_games'])}** games on {slate_date}.")
+
+        if st.button("🚀 Generate Optimal NBA DFS Lineups", key="run_nba_dfs", type="primary"):
+            if nba_pool.empty:
+                st.warning(f"No NBA games/players found for {slate_date}. Try changing the NBA Slate Date in the left sidebar!")
+            else:
                 lus = pro_sim.optimize_nba_dfs_lineups(
                     nba_pool,
                     mode=m_code,
@@ -459,12 +470,19 @@ elif sport_tab == "🏀 NBA":
                     locked_names=nba_locked,
                     excluded_names=nba_excl,
                 )
-                for idx, lu in enumerate(lus, start=1):
-                    st.markdown(
-                        f"**NBA Lineup #{idx}** — Salary: `${lu['salary'].sum():,} / $50,000` | "
-                        f"Median DK Pts: `{lu['proj'].sum():.1f}` | Ceiling: `{lu['ceiling'].sum():.1f}`"
-                    )
-                    st.dataframe(lu[["slot", "name", "team", "game", "salary", "proj", "ceiling", "est_own", "value", "flags"]], use_container_width=True, hide_index=True)
+                if not lus:
+                    st.error("No valid NBA lineups found with those locks. Try removing a locked player.")
+                else:
+                    for idx, lu in enumerate(lus, start=1):
+                        st.markdown(
+                            f"**NBA Lineup #{idx}** — Salary: `${lu['salary'].sum():,} / $50,000` | "
+                            f"Median DK Pts: `{lu['proj'].sum():.1f}` | Ceiling: `{lu['ceiling'].sum():.1f}`"
+                        )
+                        st.dataframe(lu[["slot", "name", "team", "game", "salary", "proj", "ceiling", "est_own", "value", "flags"]], use_container_width=True, hide_index=True)
+
+        if not nba_pool.empty:
+            with st.expander("📋 View Full Projected NBA Player Pool, Ownership & Leverage"):
+                st.dataframe(nba_pool.sort_values("leverage", ascending=False), use_container_width=True, hide_index=True)
 
 # =====================================================================
 #                     MEN'S COLLEGE BASKETBALL TAB
