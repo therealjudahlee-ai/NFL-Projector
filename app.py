@@ -1,5 +1,4 @@
 from datetime import datetime
-import itertools
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -17,7 +16,6 @@ st.title("📊 1,000,000-Sim Multi-Sport Prop, Spread & Parlay Engine")
 st.caption("NFL • NBA • Men's College Basketball • College Football | Recency-Weighted + Sneaky Blowout Protection")
 
 
-# Cache data loaders so switching tabs is instant
 @st.cache_resource(show_spinner="Loading NFL 2-year stats, weather & injuries...")
 def get_nfl():
     return pro_sim.build_nfl_context()
@@ -194,7 +192,7 @@ elif sport_tab == "🏀 NBA":
 
     with mode[0]:
         c1, c2, c3, c4 = st.columns(4)
-        player_in = col1_val = c1.text_input("Player Name", value="Nikola Jokic")
+        player_in = c1.text_input("Player Name", value="Nikola Jokic")
         stat_in = c2.selectbox("Stat", ["PTS", "REB", "AST", "PRA", "PR", "PA", "RA", "FG3M", "STL", "BLK"])
         line_in = c3.number_input("Prop Line", value=26.5, step=0.5)
         star_out = c4.checkbox("Star Teammate OUT (+7% Usage)")
@@ -305,8 +303,9 @@ elif sport_tab == "🎓 Men's College Basketball":
     ctx = get_ncaab(slate_date)
     st.subheader(f"Men's College Basketball — {slate_date} ({len(ctx['todays_games'])} D1 Games)")
 
-    if st.button("Simulate All Today's CBB Spreads & Totals (1M Sims/Game)"):
+    if st.button("Simulate All Today's CBB Spreads, Totals & Underdog Upsets (1M Sims/Game)"):
         rows = []
+        tight_dog_rows = []
         for g in ctx["game_list"]:
             res = col_sim.simulate_ncaab_game(g)
             rows.append({
@@ -319,7 +318,24 @@ elif sport_tab == "🎓 Men's College Basketball":
                 "Edge (Pts)": round(res["spread_edge"], 1),
                 "Blowout Risk": f"{res['blowout_prob']:.0%}{' ⚠️' if res['sneaky_blowout'] else ''}",
             })
+            if res["is_tight_dog"]:
+                tight_dog_rows.append({
+                    "Underdog": res["dog_label"],
+                    "Matchup": res["game"],
+                    "Proj Score": res["proj_score"],
+                    "Outright Win %": res["dog_win_prob"],
+                    "Fair Payout": f"{res['dog_fair_mult']:.2f}x",
+                    "Spread Cover %": f"{res['best_side_prob']:.1%}",
+                })
+
+        if tight_dog_rows:
+            st.markdown("### 🐕 Tight-Spread Underdog Outright Win Probabilities (Spread ≤ 3.5)")
+            df_dogs = pd.DataFrame(tight_dog_rows).sort_values("Outright Win %", ascending=False)
+            df_dogs["Outright Win %"] = df_dogs["Outright Win %"].map(lambda x: f"{x:.1%}")
+            st.dataframe(df_dogs, use_container_width=True)
+
         if rows:
+            st.markdown("### 📊 Full D1 Slate Spread & Blowout Projections")
             df_cbb = pd.DataFrame(rows).sort_values("Edge (Pts)", ascending=False)
             st.dataframe(df_cbb, use_container_width=True)
         else:
