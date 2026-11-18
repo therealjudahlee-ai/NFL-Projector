@@ -37,7 +37,7 @@ def generate_100_500_report(df_2yr, sort_cols, target_col, threshold, entity_mas
 
 
 # =====================================================================
-#             MEN'S COLLEGE BASKETBALL (NCAAB) ENGINE
+#       MEN'S COLLEGE BASKETBALL (NCAAB) — PROPS & GAME SPREADS
 # =====================================================================
 def build_ncaab_context(target_date_str=None):
     if not target_date_str:
@@ -63,7 +63,6 @@ def build_ncaab_context(target_date_str=None):
 
     mbb_df = pd.concat(p_dfs, ignore_index=True)
 
-    # Normalize column names safely across releases
     col_map = {
         "athlete_display_name": "PLAYER_NAME",
         "team_short_display_name": "TEAM_NAME",
@@ -99,7 +98,7 @@ def build_ncaab_context(target_date_str=None):
     mbb_df["RA"] = mbb_df["REB"] + mbb_df["AST"]
     mbb_df["IS_HOME"] = mbb_df.get("HOME_AWAY", pd.Series("home", index=mbb_df.index)).astype(str).str.lower() == "home"
 
-    # Team-level Pace, Scoring & Margin Volatility (for Sneaky Blowout detection)
+    # Team-level Pace, Scoring, Efficiency & Margin Volatility
     team_agg = (
         mbb_df.groupby(["TEAM_ABBR", "OPP_ABBR", "game_id", "GAME_DATE"])
         .agg({"PTS": "sum", "FGA": "sum", "FTA": "sum", "OREB": "sum", "TOV": "sum", "FG3A": "sum"})
@@ -131,6 +130,7 @@ def build_ncaab_context(target_date_str=None):
     espn_url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard?groups=50&limit=500&dates={date_compact}"
     matchup_map = {}
     todays_games = []
+    game_list = []
 
     try:
         resp = requests.get(espn_url, timeout=10).json()
@@ -147,7 +147,7 @@ def build_ncaab_context(target_date_str=None):
             label = f"{away_name} ({away}) @ {home_name} ({home})"
             todays_games.append(label)
 
-            # Extract Vegas spread & total if posted
+            # Extract Vegas spread & total if posted (Negative = Home Favored)
             vegas_spread, vegas_total = np.nan, np.nan
             odds_list = comp.get("odds", [])
             if odds_list:
@@ -164,12 +164,13 @@ def build_ncaab_context(target_date_str=None):
             game_pace = (team_pace.get(home, league_pace) + team_pace.get(away, league_pace)) / 2.0
             pace_ratio = game_pace / league_pace
 
-            comp_home = ((team_off.get(home, 74.0) + team_def.get(away, 74.0)) / 2.0) * (0.5 + 0.5 * pace_ratio)
-            comp_away = ((team_off.get(away, 74.0) + team_def.get(home, 74.0)) / 2.0) * (0.5 + 0.5 * pace_ratio)
+            # Pace-adjusted Computer Projected Team Scores (+3.2 D1 Home Court Edge)
+            comp_home = ((team_off.get(home, 74.0) + team_def.get(away, 74.0)) / 2.0) * (0.5 + 0.5 * pace_ratio) + 1.6
+            comp_away = ((team_off.get(away, 74.0) + team_def.get(home, 74.0)) / 2.0) * (0.5 + 0.5 * pace_ratio) - 1.6
             comp_total = comp_home + comp_away
             blended_total = (0.65 * comp_total + 0.35 * vegas_total) if pd.notna(vegas_total) else comp_total
 
-            exp_home_margin = -vegas_spread if pd.notna(vegas_spread) else (comp_home - comp_away + 3.2)
+            exp_home_margin = -vegas_spread if pd.notna(vegas_spread) else (comp_home - comp_away)
             comb_vol = np.sqrt((team_std.get(home, 12.0) ** 2 + team_std.get(away, 12.0) ** 2) / 2.0)
             if (team_3pa.get(home, 0.37) + team_3pa.get(away, 0.37)) / 2.0 >= 0.40:
                 comb_vol *= 1.12
@@ -177,6 +178,25 @@ def build_ncaab_context(target_date_str=None):
             margin_sims = np.random.normal(exp_home_margin, comb_vol, N_SIMS).astype(np.float32)
             blowout_prob = float(np.mean(np.abs(margin_sims) >= 16.0))
             sneaky_blowout = (abs(exp_home_margin) <= 4.5) and (blowout_prob >= 0.33)
+
+            game_list.append(
+                {
+                    "home": home,
+                    "away": away,
+                    "home_name": home_name,
+                    "away_name": away_name,
+                    "label": label,
+                    "vegas_spread": vegas_spread,
+                    "vegas_total": vegas_total,
+                    "proj_home": float(comp_home),
+                    "proj_away": float(comp_away),
+                    "comp_total": float(comp_total),
+                    "comb_vol": float(comb_vol),
+                    "pace_ratio": float(pace_ratio),
+                    "blowout_prob": blowout_prob,
+                    "sneaky_blowout": sneaky_blowout,
+                }
+            )
 
             for t_abbr, o_abbr, is_h, t_pts, o_pts in [
                 (home, away, True, comp_home, comp_away),
@@ -212,9 +232,69 @@ def build_ncaab_context(target_date_str=None):
         "curr_szn": curr_szn,
         "target_date": target_date_str,
         "mbb_df": mbb_df,
+        "team_agg": team_agg,
         "todays_games": todays_games,
+        "game_list": game_list,
         "matchup_map": matchup_map,
         "def_lookup": def_lookup,
+    }
+
+
+def simulate_ncaab_game(game, custom_spread=None, custom_total=None):
+    """Simulates a Men's College Basketball game 1,000,000 times for Spread & Total."""
+    proj_home = game["proj_home"]
+    proj_away = game["proj_away"]
+    comp_spread = -(proj_home - proj_away)  # Negative = Home favored
+    comp_total = game["comp_total"]
+
+    spread_line = custom_spread if custom_spread is not None else (
+        game["vegas_spread"] if pd.notna(game["vegas_spread"]) else round(comp_spread * 2) / 2
+    )
+    total_line = custom_total if custom_total is not None else (
+        game["vegas_total"] if pd.notna(game["vegas_total"]) else round(comp_total * 2) / 2
+    )
+
+    comb_vol = game["comb_vol"]
+    sim_margins = np.random.normal(proj_home - proj_away, comb_vol, N_SIMS).astype(np.float32)
+    sim_totals = np.random.normal(comp_total, comb_vol * 0.90, N_SIMS).astype(np.float32)
+
+    home_cover_prob = float(np.mean((sim_margins + spread_line) > 0))
+    away_cover_prob = float(np.mean((sim_margins + spread_line) < 0))
+    over_prob = float(np.mean(sim_totals > total_line))
+    under_prob = float(np.mean(sim_totals < total_line))
+
+    blowout_prob = float(np.mean(np.abs(sim_margins) >= 16.0))
+    sneaky_blowout = (abs(spread_line) <= 4.5) and (blowout_prob >= 0.33)
+
+    best_side = (
+        f"{game['home_name']} ({game['home']}) {spread_line:+.1f}"
+        if home_cover_prob >= away_cover_prob
+        else f"{game['away_name']} ({game['away']}) {-spread_line:+.1f}"
+    )
+    best_side_prob = max(home_cover_prob, away_cover_prob)
+    spread_edge = abs(comp_spread - spread_line)
+
+    return {
+        "game": game["label"],
+        "home": game["home"],
+        "away": game["away"],
+        "home_name": game["home_name"],
+        "away_name": game["away_name"],
+        "spread_line": spread_line,
+        "comp_spread": float(comp_spread),
+        "spread_edge": float(spread_edge),
+        "total_line": total_line,
+        "comp_total": float(comp_total),
+        "proj_score": f"{game['away']} {proj_away:.1f} - {game['home']} {proj_home:.1f}",
+        "home_cover_prob": home_cover_prob,
+        "away_cover_prob": away_cover_prob,
+        "best_side": best_side,
+        "best_side_prob": best_side_prob,
+        "fair_mult": round(1.0 / best_side_prob, 2) if best_side_prob > 0.01 else 99.0,
+        "over_prob": over_prob,
+        "under_prob": under_prob,
+        "blowout_prob": blowout_prob,
+        "sneaky_blowout": sneaky_blowout,
     }
 
 
@@ -302,17 +382,25 @@ def run_ncaab_menu(ctx=None):
         ctx = build_ncaab_context()
 
     mbb_df = ctx["mbb_df"]
+    team_agg = ctx["team_agg"]
     matchup_map = ctx["matchup_map"]
     todays_games = ctx["todays_games"]
+    game_list = ctx["game_list"]
 
     while True:
         print(f"\nMen's College Basketball Menu (Season {ctx['curr_szn']} | Date: {ctx['target_date']} | Games: {len(todays_games)}):")
+        print("  --- PLAYER PROPS ---")
         print("  [1] Single Player Prop Simulator (1,000,000 Sims)")
-        print("  [2] Auto-Scan Today's D1 Matchups & Build Parlays (1,000,000 Sims/Prop)")
-        print("  [3] NCAAB 2x–3x Value Finder (30%–50% Hit Rate + 100/500 Report)")
-        print("  [4] Change Slate Date (YYYY-MM-DD)")
-        print("  [5] Switch Sport / Back to Main Menu")
-        choice = input("Select [1/2/3/4/5]: ").strip()
+        print("  [2] Auto-Scan Player Props & Build Parlays (1,000,000 Sims/Prop)")
+        print("  [3] Player Prop 2x–3x Value Finder (30%–50% Hit Rate + 100/500 Report)")
+        print("  --- GAME SPREADS & TOTALS ---")
+        print("  [4] Single Game Spread & Total Simulator (1,000,000 Sims)")
+        print("  [5] Auto-Scan Today's CBB Spreads & Build ATS Parlays (1,000,000 Sims/Game)")
+        print("  [6] CBB 2x–3x Alt-Spread Value Finder (30%–50% Cover + 100/500 Report)")
+        print("  --- SLATE ---")
+        print("  [7] Change Slate Date (YYYY-MM-DD)")
+        print("  [8] Switch Sport / Back to Main Menu")
+        choice = input("Select [1-8]: ").strip()
 
         if choice == "1":
             print("\n--- NCAAB SINGLE PLAYER PROP SIMULATOR (1,000,000 SIMS) ---")
@@ -444,7 +532,7 @@ def run_ncaab_menu(ctx=None):
                     )
 
             if len(top_plays) >= parlay_legs:
-                print(f"\n================ TOP {parlay_legs}-LEG NCAAB PARLAYS ================")
+                print(f"\n================ TOP {parlay_legs}-LEG NCAAB PROP PARLAYS ================")
                 combos = []
                 for c in itertools.combinations(top_plays[:12], parlay_legs):
                     if len({x["game"] for x in c}) < parlay_legs:
@@ -458,15 +546,154 @@ def run_ncaab_menu(ctx=None):
                         print(f"   -> {leg['player']} ({leg['team']}) OVER {leg['line']} {leg['stat']} [{leg['over_prob']:.1%} | {leg['game']}]")
 
         elif choice == "4":
+            print("\n--- NCAAB SINGLE GAME SPREAD & TOTAL SIMULATOR (1,000,000 SIMS) ---")
+            if not game_list:
+                print("[!] No D1 games scheduled on ESPN scoreboard for this date.")
+                continue
+
+            for idx, g in enumerate(game_list[:35], start=1):
+                sp_str = f"{g['home']} {g['vegas_spread']:+.1f}" if pd.notna(g["vegas_spread"]) else "Line TBD"
+                print(f"  [{idx}] {g['label']} ({sp_str})")
+
+            sel = input("\nEnter game # from list (or type team name/abbr): ").strip()
+            game = None
+            if sel.isdigit() and 1 <= int(sel) <= len(game_list):
+                game = game_list[int(sel) - 1]
+            else:
+                matches = [g for g in game_list if sel.lower() in g["label"].lower()]
+                if matches:
+                    game = matches[0]
+
+            if not game:
+                print("[!] Game not found on today's D1 slate.")
+                continue
+
+            sp_in = input(f"Home Spread ({game['home']} spread, Enter for Vegas {game['vegas_spread']}): ").strip()
+            tot_in = input(f"Game Total (Enter for Vegas {game['vegas_total']}): ").strip()
+            c_sp = float(sp_in) if sp_in else None
+            c_tot = float(tot_in) if tot_in else None
+
+            t0 = time.time()
+            res = simulate_ncaab_game(game, custom_spread=c_sp, custom_total=c_tot)
+            elapsed = time.time() - t0
+
+            print("\n" + "=" * 74)
+            print(f" {res['game']} | Line: {res['home']} {res['spread_line']:+.1f} | Total: {res['total_line']}")
+            print("=" * 74)
+            print(f" Sims Run:          {N_SIMS:,} ({elapsed:.2f}s) | Comp Score: {res['proj_score']}")
+            print(f" Model Fair Spread: {res['home']} {res['comp_spread']:+.1f} (Edge: {res['spread_edge']:.1f} pts)")
+            print(f" 16+ Blowout Prob:  {res['blowout_prob']:.1%} {'[!] SNEAKY CLOSE-SPREAD BLOWOUT RISK' if res['sneaky_blowout'] else ''}")
+            print("-" * 74)
+            print(f" {res['home_name']} ({res['home']}) {res['spread_line']:+.1f} Cover Prob:  {res['home_cover_prob']:.2%}")
+            print(f" {res['away_name']} ({res['away']}) {-res['spread_line']:+.1f} Cover Prob:  {res['away_cover_prob']:.2%}")
+            print(f" OVER {res['total_line']:<5} Prob:               {res['over_prob']:.2%}  |  UNDER Prob: {res['under_prob']:.2%}")
+            print("=" * 74)
+
+        elif choice == "5":
+            print("\n--- TODAY'S NCAAB AUTOMATED SPREAD (ATS) PARLAY BUILDER ---")
+            if not game_list:
+                print("[!] No D1 games scheduled for this date.")
+                continue
+
+            try:
+                rate_in = float(input("Minimum Cover Prob % per leg (e.g., 58 for 58%): ").strip() or "58")
+                min_prob = rate_in / 100.0 if rate_in > 1 else rate_in
+                legs = int(input("Legs per parlay (e.g., 3): ").strip() or "3")
+                skip_blowouts = input("Skip high Blowout-Risk games (including sneaky -2.5 traps)? [Y/n]: ").strip().lower() != "n"
+            except ValueError:
+                min_prob, legs, skip_blowouts = 0.58, 3, True
+
+            t0 = time.time()
+            qualifying = []
+            for g in game_list:
+                res = simulate_ncaab_game(g)
+                if skip_blowouts and res["blowout_prob"] >= 0.36:
+                    continue
+                if res["best_side_prob"] >= min_prob:
+                    qualifying.append(res)
+
+            elapsed = time.time() - t0
+            qualifying.sort(key=lambda x: x["best_side_prob"], reverse=True)
+            print(f"\nSimulated {len(game_list) * N_SIMS:,} CBB games in {elapsed:.1f}s | Found {len(qualifying)} ATS edges >= {min_prob:.0%}:")
+            for q in qualifying[:12]:
+                print(
+                    f"  [{q['best_side_prob']:.2%}] {q['best_side']} (Model: {q['home']} {q['comp_spread']:+.1f} | "
+                    f"Edge: {q['spread_edge']:.1f} pts | Blowout: {q['blowout_prob']:.0%})"
+                )
+
+            if len(qualifying) >= legs:
+                print(f"\n================ TOP {legs}-LEG NCAAB ATS PARLAYS ================")
+                combos = list(itertools.combinations(qualifying[:10], legs))
+                scored = [(float(np.prod([x["best_side_prob"] for x in c])), c) for c in combos]
+                scored.sort(key=lambda x: x[0], reverse=True)
+                for idx, (prob, c) in enumerate(scored[:5], start=1):
+                    odds = int(-100 * prob / (1 - prob)) if prob > 0.5 else int(100 * (1 - prob) / prob)
+                    print(f"\nParlay #{idx} | Combined Cover Prob: {prob:.2%} (Fair Odds: {odds:+d})")
+                    for leg in c:
+                        print(f"   -> {leg['best_side']} [{leg['best_side_prob']:.2%} | Edge: {leg['spread_edge']:.1f} pts | {leg['game']}]")
+
+        elif choice == "6":
+            print("\n--- NCAAB 2x–3x ALT-SPREAD VALUE FINDER (30%–50% COVER + 100/500 REPORT) ---")
+            if not game_list:
+                print("[!] No D1 games scheduled for this date.")
+                continue
+
+            try:
+                min_pct = float(input("Minimum Cover Prob % (default 30): ").strip() or "30")
+                max_pct = float(input("Maximum Cover Prob % (default 50): ").strip() or "50")
+                min_prob = min_pct / 100.0 if min_pct > 1 else min_pct
+                max_prob = max_pct / 100.0 if max_pct > 1 else max_pct
+            except ValueError:
+                min_prob, max_prob = 0.30, 0.50
+
+            t0 = time.time()
+            val_plays = []
+            for g in game_list:
+                base_res = simulate_ncaab_game(g)
+                # Push spread by 6.5 and 10.5 points in the model's favored direction for 2x-3x payout
+                for push in [6.5, 10.5]:
+                    alt_sp = (
+                        base_res["spread_line"] - push
+                        if base_res["comp_spread"] < base_res["spread_line"]
+                        else base_res["spread_line"] + push
+                    )
+                    res = simulate_ncaab_game(g, custom_spread=alt_sp)
+                    if min_prob <= res["best_side_prob"] <= max_prob and res["spread_edge"] >= 1.5:
+                        val_plays.append(res)
+
+            elapsed = time.time() - t0
+            val_plays.sort(key=lambda x: x["best_side_prob"] * (1.0 + 0.05 * x["spread_edge"]), reverse=True)
+            print(f"\nCompleted {len(game_list) * 2 * N_SIMS:,} CBB alt-spread sims in {elapsed:.1f}s!")
+
+            # 2-Year Historical D1 Margin Cover Report (Last 100 & Last 500 D1 games)
+            team_agg["ABS_MARGIN"] = team_agg["MARGIN"].abs()
+            unique_games = team_agg.drop_duplicates(subset=["game_id"]).sort_values("GAME_DATE")
+            rep = generate_100_500_report(unique_games, ["GAME_DATE"], "ABS_MARGIN", 12.0)
+            print(
+                f"D1 2-Yr Double-Digit Margin Trend (12+ pts): Last 100g Weighted {rep[100]['weighted_rate']:.1%} | "
+                f"Last 500g Weighted {rep[500]['weighted_rate']:.1%}"
+            )
+
+            for idx, p in enumerate(val_plays[:10], start=1):
+                print(
+                    f"\n#{idx} [NCAAB ALT-SPREAD] {p['best_side']}  |  Cover Prob: {p['best_side_prob']:.1%} "
+                    f"(Fair Payout: {p['fair_mult']:.2f}x)"
+                )
+                print(
+                    f"    Matchup: {p['game']} | Comp Score: {p['proj_score']} | Model Fair Line: {p['home']} {p['comp_spread']:+.1f}"
+                )
+
+        elif choice == "7":
             nd = input("Enter NCAAB Date (YYYY-MM-DD): ").strip()
             if nd:
                 ctx = build_ncaab_context(nd)
-                mbb_df, matchup_map, todays_games = ctx["mbb_df"], ctx["matchup_map"], ctx["todays_games"]
+                mbb_df, team_agg = ctx["mbb_df"], ctx["team_agg"]
+                matchup_map, todays_games, game_list = ctx["matchup_map"], ctx["todays_games"], ctx["game_list"]
 
-        elif choice == "5" or choice.lower() in ["back", "quit", "exit", "q"]:
+        elif choice == "8" or choice.lower() in ["back", "quit", "exit", "q"]:
             break
         else:
-            print("Invalid choice.")
+            print("Invalid choice. Enter 1 through 8.")
 
     return ctx
 
@@ -497,11 +724,9 @@ def build_ncaaf_context():
     sched_df["game_date"] = pd.to_datetime(sched_df["start_date"], errors="coerce")
     completed = sched_df.dropna(subset=["home_points", "away_points"]).sort_values("game_date")
 
-    # Compute recency-weighted Team Offense, Defense, Yards/Play & Turnover Margin
     team_stats = {}
     all_teams = set(completed["home_team"].dropna()).union(set(completed["away_team"].dropna()))
 
-    # Optional yards per play & turnovers from team_box
     ypp_map, to_map = {}, {}
     if box_dfs:
         box_df = pd.concat(box_dfs, ignore_index=True)
@@ -530,7 +755,6 @@ def build_ncaaf_context():
             "games_played": len(g),
         }
 
-    # Fetch Upcoming FBS Games & Live Spreads from ESPN Scoreboard
     espn_cfb_url = "https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?groups=80&limit=200"
     upcoming_games = []
     try:
@@ -548,7 +772,7 @@ def build_ncaaf_context():
             home_abbr = home_c["team"]["abbreviation"]
             away_abbr = away_c["team"]["abbreviation"]
 
-            vegas_spread = np.nan  # Negative = Home Favored
+            vegas_spread = np.nan
             vegas_total = np.nan
             odds_list = comp.get("odds", [])
             if odds_list:
@@ -591,14 +815,13 @@ def simulate_cfb_game(ctx, game, custom_spread=None, custom_total=None):
     h_st = t_stats.get(home, {"off_pts": 27.0, "def_pts": 27.0, "margin_std": 13.5, "ypp": 5.6, "tov": 1.3})
     a_st = t_stats.get(away, {"off_pts": 27.0, "def_pts": 27.0, "margin_std": 13.5, "ypp": 5.6, "tov": 1.3})
 
-    # Base projected team points + Yards/Play efficiency edge + Turnover edge + +2.8 Home Field
     ypp_edge = (h_st["ypp"] - a_st["ypp"]) * 2.5
     tov_edge = (a_st["tov"] - h_st["tov"]) * 2.2
 
     proj_home = ((h_st["off_pts"] + a_st["def_pts"]) / 2.0) + 1.4 + (ypp_edge / 2.0) + (tov_edge / 2.0)
     proj_away = ((a_st["off_pts"] + h_st["def_pts"]) / 2.0) - 1.4 - (ypp_edge / 2.0) - (tov_edge / 2.0)
 
-    comp_spread = -(proj_home - proj_away)  # Negative = Home favored
+    comp_spread = -(proj_home - proj_away)
     comp_total = proj_home + proj_away
 
     spread_line = custom_spread if custom_spread is not None else (
@@ -610,9 +833,8 @@ def simulate_cfb_game(ctx, game, custom_spread=None, custom_total=None):
 
     comb_std = np.sqrt((h_st["margin_std"] ** 2 + a_st["margin_std"] ** 2) / 2.0)
     if comp_total >= 58.0:
-        comb_std *= 1.12  # Shootouts amplify late-game margin swings
+        comb_std *= 1.12
 
-    # Simulate 1,000,000 College Football games
     sim_margins = np.random.normal(proj_home - proj_away, comb_std, N_SIMS).astype(np.float32)
     sim_totals = np.random.normal(comp_total, comb_std * 0.92, N_SIMS).astype(np.float32)
 
@@ -758,7 +980,6 @@ def run_ncaaf_menu(ctx=None):
             val_plays = []
             for g in upcoming:
                 base_res = simulate_cfb_game(ctx, g)
-                # Test aggressive alt-spreads (-7.5 and -13.5 beyond projected spread) for 2x-3x payout
                 for push in [7.5, 13.5]:
                     alt_sp = base_res["spread_line"] - push if base_res["comp_spread"] < base_res["spread_line"] else base_res["spread_line"] + push
                     res = simulate_cfb_game(ctx, g, custom_spread=alt_sp)
@@ -769,7 +990,6 @@ def run_ncaaf_menu(ctx=None):
             val_plays.sort(key=lambda x: x["best_side_prob"] * (1.0 + 0.05 * x["spread_edge"]), reverse=True)
             print(f"\nCompleted {len(upcoming) * 2 * N_SIMS:,} CFB alt-spread sims in {elapsed:.1f}s!")
 
-            # 2-Year Historical FBS Margin Cover Report (Last 100 & Last 500 FBS games)
             completed["abs_margin"] = (completed["home_points"] - completed["away_points"]).abs()
             rep = generate_100_500_report(completed, ["game_date"], "abs_margin", 14.0)
             print(
@@ -806,7 +1026,7 @@ if __name__ == "__main__":
 
     while True:
         print("\nSelect a College Sport:")
-        print("  [1] Men's College Basketball (Props, Parlays & 2x–3x Value Finder)")
+        print("  [1] Men's College Basketball (Props, Spreads, Parlays & 2x–3x Value)")
         print("  [2] College Football (Spreads, Totals, ATS Parlays & 2x–3x Alt-Spreads)")
         print("  [3] Quit")
         choice = input("Select [1/2/3]: ").strip()
