@@ -1,6 +1,8 @@
 from datetime import datetime
 import itertools
 import os
+import subprocess
+import sys
 import time
 from nba_api.stats.endpoints import leaguegamelog, scoreboardv2
 import nflreadpy as nfl
@@ -85,7 +87,7 @@ def build_nfl_context():
 
     reg_stats["dk_points"] = compute_dk_points(reg_stats)
 
-    # Load weekly NFL injury reports (safely handles pre-report weeks)
+    # Load weekly NFL injury reports
     out_players = set()
     team_pos_bump = {}
     try:
@@ -100,7 +102,6 @@ def build_nfl_context():
                     out_players.add(p_name)
                 t_abbr = str(r.get("team", "")).strip()
                 pos_str = str(r.get("position", "")).strip()
-                # Check if missing player was a high-usage starter
                 hist = reg_stats[
                     (reg_stats["player_display_name"].str.lower() == p_name)
                     & (reg_stats["season"] == current_season)
@@ -155,17 +156,15 @@ def build_nfl_context():
         comp_total = comp_home_pts + comp_away_pts
         blended_total = (0.65 * comp_total + 0.35 * vegas_total) if has_vegas else comp_total
 
-        # 1,000,000-Sim Game Margin Simulation (catches high-variance blowouts even in -2.5 spreads)
         home_spread = -spread if pd.notna(spread) else (comp_away_pts - comp_home_pts)
         away_spread = -home_spread
         exp_home_margin = -home_spread
         comb_vol = np.sqrt((team_margin_std.get(home, 11.0) ** 2 + team_margin_std.get(away, 11.0) ** 2) / 2.0)
-        # High-total games carry extra turnover/snowball variance
         if blended_total >= 47.5:
             comb_vol *= 1.12
 
         margin_sims = np.random.normal(exp_home_margin, comb_vol, N_SIMS).astype(np.float32)
-        blowout_prob = float(np.mean(np.abs(margin_sims) >= 14.0))  # 2+ TD blowout rate
+        blowout_prob = float(np.mean(np.abs(margin_sims) >= 14.0))
         sneaky_blowout = (abs(home_spread) <= 4.0) and (blowout_prob >= 0.32)
 
         for team, opp, t_spread, t_pts, is_home in [
@@ -249,7 +248,6 @@ def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manua
     else:
         healthy = recent.tail(12).copy()
 
-    # Consistency score (% of last 10 healthy games clearing 85% of mean)
     h10 = healthy.tail(10)
     consistency = float(np.mean(h10[stat_col] >= (h10[stat_col].mean() * 0.85))) if not h10.empty else 0.5
 
@@ -275,7 +273,6 @@ def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manua
             else 1.0 + (team_spread * 0.005)
         )
 
-        # Weather & Short Week adjustments
         if game_info["roof"] in ["outdoors", "open"] and game_info["wind"] >= 15.0:
             if stat_col in ["passing_yards", "receiving_yards", "receptions"]:
                 weather_mult *= 0.91
@@ -287,7 +284,6 @@ def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manua
             weather_mult *= 0.96
             flags.append("TNF Road (-4%)")
 
-        # Blowout 4th-quarter benching / garbage-time adjustment
         blowout_penalty = 1.0
         if blowout_prob >= 0.35:
             if stat_col in ["passing_yards", "receiving_yards", "receptions"] and team_spread <= -7.0:
@@ -397,7 +393,6 @@ def build_nba_context(target_date_str=None):
     nba_df["PA"] = nba_df["PTS"] + nba_df["AST"]
     nba_df["RA"] = nba_df["REB"] + nba_df["AST"]
 
-    # Team-level Pace, Scoring, Margin Volatility & 3PA Variance (for Sneaky Blowouts)
     team_agg = (
         nba_df.groupby(["TEAM_ABBREVIATION", "OPP_ABBR", "GAME_ID", "GAME_DATE"])
         .agg({"PTS": "sum", "FGA": "sum", "FTA": "sum", "OREB": "sum", "TOV": "sum", "FG3A": "sum"})
@@ -429,7 +424,7 @@ def build_nba_context(target_date_str=None):
 
     league_pace = np.mean(list(team_pace.values())) if team_pace else 99.5
 
-    # Detect Missing Star Teammates (played >= 26 mins in last 15 games, missed team's last 1-2 games)
+    # Detect Missing Star Teammates
     team_usage_bump = {}
     for t, grp in nba_df.groupby("TEAM_ABBREVIATION"):
         recent_gids = grp.sort_values("GAME_DATE")["GAME_ID"].unique()
@@ -442,7 +437,7 @@ def build_nba_context(target_date_str=None):
                 if pid not in set(grp[grp["GAME_ID"].isin(last_2_gids)]["PLAYER_ID"]):
                     team_usage_bump[t] = min(1.12, team_usage_bump.get(t, 1.0) + 0.05)
 
-    # Fetch Exact Date NBA Matchups via ScoreboardV2 (works at any hour of the day)
+    # Fetch Exact Date NBA Matchups via ScoreboardV2
     nba_matchups = {}
     todays_games = []
     target_dt = pd.to_datetime(target_date_str)
@@ -461,7 +456,6 @@ def build_nba_context(target_date_str=None):
             if label not in todays_games:
                 todays_games.append(label)
 
-            # Pace-adjusted computer projected total
             game_pace = (team_pace.get(home, league_pace) + team_pace.get(away, league_pace)) / 2.0
             pace_ratio = game_pace / league_pace
 
@@ -473,12 +467,10 @@ def build_nba_context(target_date_str=None):
             )
             comp_total = comp_home + comp_away
 
-            # 1,000,000-Sim Game Margin Simulation (catches high-variance 3PT blowouts even in -2.5 spreads)
-            exp_home_margin = comp_home - comp_away + 2.2  # +2.2 home court edge
+            exp_home_margin = comp_home - comp_away + 2.2
             comb_vol = np.sqrt(
                 (team_margin_std.get(home, 12.0) ** 2 + team_margin_std.get(away, 12.0) ** 2) / 2.0
             )
-            # High 3-point attempt rates amplify blowout volatility even when projected margin is close
             avg_3pa_rate = (team_3pa_rate.get(home, 0.39) + team_3pa_rate.get(away, 0.39)) / 2.0
             if avg_3pa_rate >= 0.41:
                 comb_vol *= 1.12
@@ -546,7 +538,6 @@ def simulate_nba_prop(ctx, p_logs, opponent_abbr, stat_col, prop_line=0.0, manua
     if len(healthy) < 4:
         healthy = rec_logs.tail(15).copy()
 
-    # Consistency score (% of last 10 healthy games clearing 85% of mean)
     h10 = healthy.tail(10)
     consistency = float(np.mean(h10[stat_col] >= (h10[stat_col].mean() * 0.85))) if not h10.empty else 0.5
 
@@ -574,18 +565,15 @@ def simulate_nba_prop(ctx, p_logs, opponent_abbr, stat_col, prop_line=0.0, manua
         sneaky_blowout = game_info["sneaky_blowout"]
         pace_mult = float(np.clip(game_info["pace_ratio"], 0.92, 1.10))
 
-        # Home vs. Away split blending (25% weight on home/away environment)
         split_logs = healthy[healthy["IS_HOME"] == game_info["is_home"]]
         if len(split_logs) >= 4:
             split_rate = (split_logs[stat_col] / split_logs["MIN"].replace(0, np.nan)).dropna().mean()
             ewm_rate = 0.75 * ewm_rate + 0.25 * split_rate
 
-        # Road Back-to-Back fatigue penalty
         if game_info["is_b2b"]:
             fatigue_mult = 0.95 if not game_info["is_home"] else 0.975
             flags.append(f"{'Road' if not game_info['is_home'] else 'Home'} B2B")
 
-        # Blowout 4th-quarter starter benching penalty (for starters playing >= 26 mins)
         if blowout_prob >= 0.34 and ewm_min >= 26.0:
             min_adj_mult = 0.92
             flags.append(
@@ -1339,14 +1327,20 @@ if __name__ == "__main__":
         print("\nSelect a Sport:")
         print("  [1] NFL (Props, Parlays, DFS Optimizer & 2x–3x Value Finder)")
         print("  [2] NBA (Props, Parlays & 2x–3x Value Finder)")
-        print("  [3] Quit")
-        sport = input("Select [1/2/3]: ").strip()
+        print("  [3] College Sports (Men's CBB Props & College Football Spreads)")
+        print("  [4] Quit")
+        sport = input("Select [1/2/3/4]: ").strip()
 
         if sport == "1":
             cached_nfl = run_nfl_menu(cached_nfl)
         elif sport == "2":
             cached_nba = run_nba_menu(cached_nba)
-        elif sport == "3" or sport.lower() in ["quit", "exit", "q"]:
+        elif sport == "3":
+            if os.path.exists("college_simulator.py"):
+                subprocess.run([sys.executable, "college_simulator.py"])
+            else:
+                print("[!] college_simulator.py not found in this folder yet. Create it first!")
+        elif sport == "4" or sport.lower() in ["quit", "exit", "q"]:
             break
         else:
-            print("Invalid choice. Enter 1, 2, or 3.")
+            print("Invalid choice. Enter 1, 2, 3, or 4.")
