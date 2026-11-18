@@ -432,7 +432,6 @@ def build_nfl_dfs_pool(nfl_ctx, site="DK", custom_csv_df=None):
 
         val = (res["proj"] / salary) * 1000.0
         team_pts = matchup_map[team]["team_proj_pts"]
-        # Estimate field ownership % from value + implied team score
         est_own = float(np.clip(((val - 1.6) * 8.5) + ((team_pts - 21.0) * 1.1), 1.5, 38.0))
         leverage_pts = float(res["ceiling"] * (1.0 - (est_own / 100.0) * 0.45))
 
@@ -526,7 +525,6 @@ def optimize_nfl_dfs_lineups(
         LinearConstraint(df_pool["pos"].isin(["RB", "WR", "TE"]).astype(float).values, 7, 7),
     ]
 
-    # Lock / Exclude constraints
     lb = np.zeros(n)
     ub = np.ones(n)
     for idx, row in df_pool.iterrows():
@@ -536,7 +534,6 @@ def optimize_nfl_dfs_lineups(
         elif nm in locked_names:
             lb[idx] = 1.0
 
-    # Game Stacking & Opponent Bring-Back Constraints
     teams = df_pool["team"].unique()
     for t in teams:
         qb_t = ((df_pool["team"] == t) & (df_pool["pos"] == "QB")).astype(float).values
@@ -552,14 +549,11 @@ def optimize_nfl_dfs_lineups(
         if "bringback" in stack_type:
             base_constraints.append(LinearConstraint(opp_skill - qb_t, 0, np.inf))
 
-        # Anti-Cannibalization: No opposing skill players against selected DST
         if no_opp_vs_dst:
             dst_t = ((df_pool["team"] == t) & (df_pool["pos"] == "DST")).astype(float).values
             if dst_t.sum() > 0 and opp_skill.sum() > 0:
-                # If DST is selected (1), opp_skill must be 0
                 base_constraints.append(LinearConstraint(opp_skill + (7.0 * dst_t), 0, 7.0))
 
-        # Max 1 RB per team
         if max_1_rb_per_team:
             rb_t = ((df_pool["team"] == t) & (df_pool["pos"] == "RB")).astype(float).values
             if rb_t.sum() > 1:
@@ -570,7 +564,6 @@ def optimize_nfl_dfs_lineups(
     max_appearances = max(1, int(np.ceil(num_lineups * max_exposure)))
 
     for lu_idx in range(num_lineups):
-        # Enforce max exposure for non-locked players
         cur_ub = ub.copy()
         if lu_idx > 0:
             for i in range(n):
@@ -603,7 +596,6 @@ def optimize_nfl_dfs_lineups(
         chosen["slot"] = slots
         lineups.append(chosen)
 
-        # Uniqueness constraint for next lineup: overlap <= (9 - min_unique)
         prev_vec = sel_mask.astype(float)
         base_constraints.append(LinearConstraint(prev_vec, 0, 9 - min_unique))
 
@@ -613,6 +605,40 @@ def optimize_nfl_dfs_lineups(
 # =====================================================================
 #                        NBA DATA & ENGINE LOADER
 # =====================================================================
+def _ensure_nba_dk_pts(df):
+    """Computes DraftKings NBA fantasy points on the fly if missing from cached DataFrames."""
+    if "DK_PTS" in df.columns:
+        return df
+    df = df.copy()
+    pts = df["PTS"] if "PTS" in df.columns else 0
+    reb = df["REB"] if "REB" in df.columns else 0
+    ast = df["AST"] if "AST" in df.columns else 0
+    fg3m = df["FG3M"] if "FG3M" in df.columns else 0
+    stl = df["STL"] if "STL" in df.columns else 0
+    blk = df["BLK"] if "BLK" in df.columns else 0
+    tov = df["TOV"] if "TOV" in df.columns else 0
+
+    dd_cats = (
+        (pts >= 10).astype(int)
+        + (reb >= 10).astype(int)
+        + (ast >= 10).astype(int)
+        + (stl >= 10).astype(int)
+        + (blk >= 10).astype(int)
+    )
+    df["DK_PTS"] = (
+        pts * 1.0
+        + fg3m * 0.5
+        + reb * 1.25
+        + ast * 1.5
+        + stl * 2.0
+        + blk * 2.0
+        - tov * 0.5
+        + np.where(dd_cats >= 2, 1.5, 0.0)
+        + np.where(dd_cats >= 3, 3.0, 0.0)
+    )
+    return df
+
+
 def build_nba_context(target_date_str=None):
     if not target_date_str:
         target_date_str = datetime.now().strftime("%Y-%m-%d")
@@ -684,26 +710,7 @@ def build_nba_context(target_date_str=None):
     nba_df["PR"] = nba_df["PTS"] + nba_df["REB"]
     nba_df["PA"] = nba_df["PTS"] + nba_df["AST"]
     nba_df["RA"] = nba_df["REB"] + nba_df["AST"]
-
-    # DraftKings NBA Fantasy Points (with Double-Double / Triple-Double bonuses)
-    dd_cats = (
-        (nba_df["PTS"] >= 10).astype(int)
-        + (nba_df["REB"] >= 10).astype(int)
-        + (nba_df["AST"] >= 10).astype(int)
-        + (nba_df["STL"] >= 10).astype(int)
-        + (nba_df["BLK"] >= 10).astype(int)
-    )
-    nba_df["DK_PTS"] = (
-        nba_df["PTS"] * 1.0
-        + nba_df["FG3M"] * 0.5
-        + nba_df["REB"] * 1.25
-        + nba_df["AST"] * 1.5
-        + nba_df["STL"] * 2.0
-        + nba_df["BLK"] * 2.0
-        - nba_df["TOV"] * 0.5
-        + np.where(dd_cats >= 2, 1.5, 0.0)
-        + np.where(dd_cats >= 3, 3.0, 0.0)
-    )
+    nba_df = _ensure_nba_dk_pts(nba_df)
 
     agg_dict = {"PTS": "sum", "FGA": "sum", "FTA": "sum", "OREB": "sum", "TOV": "sum"}
     if "FG3A" in nba_df.columns:
@@ -846,6 +853,9 @@ def build_nba_context(target_date_str=None):
 
 
 def simulate_nba_prop(ctx, p_logs, opponent_abbr, stat_col, prop_line=0.0, manual_bump=1.0):
+    if stat_col == "DK_PTS" and "DK_PTS" not in p_logs.columns:
+        p_logs = _ensure_nba_dk_pts(p_logs)
+
     rec_logs = p_logs.sort_values("GAME_DATE").tail(22).copy()
     full_name = rec_logs["PLAYER_NAME"].iloc[-1]
     team_abbr = rec_logs["TEAM_ABBREVIATION"].iloc[-1]
@@ -942,7 +952,7 @@ def simulate_nba_prop(ctx, p_logs, opponent_abbr, stat_col, prop_line=0.0, manua
 
 def build_nba_dfs_pool(nba_ctx, custom_csv_df=None):
     """Builds projected DraftKings NBA DFS pool (8-man roster under $50,000)."""
-    nba_df = nba_ctx["nba_df"]
+    nba_df = _ensure_nba_dk_pts(nba_ctx["nba_df"])
     matchup_map = nba_ctx["matchup_map"]
 
     csv_salaries = {}
@@ -1002,7 +1012,6 @@ def optimize_nba_dfs_lineups(df_pool, mode="gpp", num_lineups=1, min_unique=2, m
         LinearConstraint(df_pool["salary"].values, 0, 50000),
         LinearConstraint(np.ones(n), 8, 8),
     ]
-    # Max 4 players per NBA game to avoid over-concentration
     for g in df_pool["game"].unique():
         g_vec = (df_pool["game"] == g).astype(float).values
         constraints.append(LinearConstraint(g_vec, 0, 4))
