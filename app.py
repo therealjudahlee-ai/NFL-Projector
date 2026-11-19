@@ -53,7 +53,6 @@ def ensure_nba_dk_pts(df):
 
 def render_parlay_tickets(legs, n_legs, max_parlays, is_single_game=False, sport_label="NFL"):
     """Builds and renders tiered, cleanly separated Parlay Ticket Cards."""
-    # Deduplicate to 1 best prop per player first so tickets never repeat the same player
     best_per_player = []
     seen_p = set()
     for lg in sorted(legs, key=lambda x: x["over_prob"], reverse=True):
@@ -99,7 +98,6 @@ def render_parlay_tickets(legs, n_legs, max_parlays, is_single_game=False, sport
 
     scored_combos.sort(key=lambda item: item[0], reverse=True)
 
-    # Select diverse tickets (limit how many times any single player can appear across tickets)
     selected_tickets = []
     player_usage = {}
     max_reuse = 2 if is_single_game else 1
@@ -113,7 +111,6 @@ def render_parlay_tickets(legs, n_legs, max_parlays, is_single_game=False, sport
         if len(selected_tickets) >= max_parlays:
             break
 
-    # Fallback if strict diversity cap yielded fewer than max_parlays
     if len(selected_tickets) < max_parlays:
         used_sigs = {tuple(sorted(x["player"] for x in t[2])) for t in selected_tickets}
         for rank_score, adj_prob, is_corr, combo in scored_combos:
@@ -248,19 +245,28 @@ if sport_tab == "🏈 NFL":
 
         slate_scope = st.radio(
             "Game Filter",
-            ["🌙 Thursday Night Football (TNF SGP)", "🏈 Full Week Slate"],
+            ["🌙 Thursday Night Football / Single-Game SGP", "🏈 Full Week Slate"],
             horizontal=True,
             key="nfl_parlay_scope",
         )
 
         tnf_teams = {t for t, info in matchup_map.items() if info.get("is_thursday")}
+        all_game_labels = sorted({info["game_label"] for info in matchup_map.values()})
         is_tnf_mode = "Thursday" in slate_scope
+        selected_single_game = None
+
         if is_tnf_mode:
             if tnf_teams:
-                tnf_label = next(matchup_map[t]["game_label"] for t in tnf_teams)
-                st.info(f"**Tonight's TNF Matchup:** {tnf_label} (Short-week road fatigue & live IR filters active)")
+                selected_single_game = next(matchup_map[t]["game_label"] for t in tnf_teams)
+                st.info(f"**Tonight's TNF Matchup:** {selected_single_game} (Short-week road fatigue & live IR filters active)")
+            elif all_game_labels:
+                selected_single_game = st.selectbox(
+                    "Select Standalone / Primetime Game for Single-Game Parlay (SGP):",
+                    all_game_labels,
+                    key="nfl_sgp_game_pick",
+                )
             else:
-                st.warning("No Thursday Night Football game found in this week's schedule. Switch to **Full Week Slate** to scan all games.")
+                st.warning("No games found in this week's schedule.")
 
         if st.button("🚀 Build Tiered NFL Parlays", key="nfl_parlay", type="primary"):
             recent_pool = reg_stats[
@@ -296,7 +302,7 @@ if sport_tab == "🏈 NFL":
                 pos = p["position"]
                 if t not in matchup_map or pos not in pos_props:
                     continue
-                if is_tnf_mode and tnf_teams and t not in tnf_teams:
+                if is_tnf_mode and selected_single_game and matchup_map[t]["game_label"] != selected_single_game:
                     continue
                 if skip_bo and matchup_map[t]["blowout_prob"] >= 0.35:
                     continue
@@ -343,15 +349,23 @@ if sport_tab == "🏈 NFL":
         c1, c2, c3, c4 = st.columns(4)
         p_min = c1.slider("Min Hit Rate %", 20, 45, 30, key="nfl_v1") / 100.0
         p_max = c2.slider("Max Hit Rate %", 35, 60, 50, key="nfl_v2") / 100.0
-        val_scope = c3.selectbox("Game Filter", ["Full Week Slate", "🌙 Thursday Night Football Only"], key="nfl_val_scope")
+        val_scope = c3.selectbox("Game Filter", ["Full Week Slate", "🌙 Thursday Night Football / Single Game"], key="nfl_val_scope")
         skip_bo_v = c4.checkbox("Skip Blowout-Risk Games", value=False, key="nfl_bo2")
+
+        tnf_teams_v = {t for t, info in matchup_map.items() if info.get("is_thursday")}
+        all_game_labels_v = sorted({info["game_label"] for info in matchup_map.values()})
+        val_single_game = None
+        if "Thursday" in val_scope:
+            if tnf_teams_v:
+                val_single_game = next(matchup_map[t]["game_label"] for t in tnf_teams_v)
+            elif all_game_labels_v:
+                val_single_game = st.selectbox("Select Game for Value Finder:", all_game_labels_v, key="nfl_val_game_pick")
 
         if st.button("Find 2x–3x Value Plays + 100/500 Report", key="nfl_val"):
             recent_pool = reg_stats[(reg_stats["season"] == ctx["season"]) & (reg_stats["week"] >= max(1, ctx["week"] - 4))]
             active = recent_pool[["player_id", "player_display_name", "position", team_col]].drop_duplicates(subset=["player_id"])
             vol_map = {"passing_yards": ("attempts", 10), "rushing_yards": ("carries", 5), "receiving_yards": ("targets", 3), "receptions": ("targets", 3)}
             pos_props = {"QB": ["passing_yards"], "RB": ["rushing_yards", "receiving_yards"], "WR": ["receiving_yards", "receptions"], "TE": ["receiving_yards", "receptions"]}
-            tnf_teams_v = {t for t, info in matchup_map.items() if info.get("is_thursday")}
 
             rows = []
             for _, p in active.iterrows():
@@ -362,7 +376,7 @@ if sport_tab == "🏈 NFL":
                 pos = p["position"]
                 if t not in matchup_map or pos not in pos_props:
                     continue
-                if "Thursday" in val_scope and tnf_teams_v and t not in tnf_teams_v:
+                if "Thursday" in val_scope and val_single_game and matchup_map[t]["game_label"] != val_single_game:
                     continue
                 if skip_bo_v and matchup_map[t]["blowout_prob"] >= 0.35:
                     continue

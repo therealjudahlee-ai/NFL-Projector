@@ -336,7 +336,9 @@ def build_nfl_context():
     curr_sched = schedules[schedules["season"] == current_season]
     wk_games = curr_sched[curr_sched["week"] == current_week].copy()
     matchup_map = {}
-    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    now_et = pd.Timestamp.now(tz="America/New_York")
+    today_et_str = now_et.strftime("%Y-%m-%d")
 
     for _, game in wk_games.iterrows():
         home, away = game["home_team"], game["away_team"]
@@ -348,13 +350,12 @@ def build_nfl_context():
         wind = float(game.get("wind", 0)) if pd.notna(game.get("wind", np.nan)) else 0.0
         temp = float(game.get("temp", 65)) if pd.notna(game.get("temp", np.nan)) else 65.0
 
-        # Check both 'weekday' column ('Thursday') and 'gameday' date string ('2026-11-19')
         weekday_str = str(game.get("weekday", "")).lower()
         gameday_str = str(game.get("gameday", "")).strip()
         is_thursday = (
             ("thursday" in weekday_str)
             or ("thursday" in gameday_str.lower())
-            or (gameday_str == today_str and datetime.now().weekday() == 3)
+            or (gameday_str == today_et_str and now_et.weekday() == 3)
         )
 
         comp_home_pts = (team_off_pts.get(home, 22.0) + team_def_pts.get(away, 22.0)) / 2.0
@@ -393,6 +394,25 @@ def build_nfl_context():
                 "temp": temp,
                 "is_thursday": is_thursday,
             }
+
+    # Verify tonight's live Thursday game directly from ESPN's NFL Scoreboard API
+    try:
+        tz_today = now_et.strftime("%Y%m%d")
+        sb = requests.get(
+            f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?dates={tz_today}",
+            timeout=8,
+        ).json()
+        for ev in sb.get("events", []):
+            comp = ev["competitions"][0]
+            comps = comp["competitors"]
+            h_abbr = espn_abbr_map.get(comps[0]["team"]["abbreviation"], comps[0]["team"]["abbreviation"])
+            a_abbr = espn_abbr_map.get(comps[1]["team"]["abbreviation"], comps[1]["team"]["abbreviation"])
+            if now_et.weekday() == 3:
+                for t_code in [h_abbr, a_abbr]:
+                    if t_code in matchup_map:
+                        matchup_map[t_code]["is_thursday"] = True
+    except Exception:
+        pass
 
     def_lookup = {}
     all_stats = [
