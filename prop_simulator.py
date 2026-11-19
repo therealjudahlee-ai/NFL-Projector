@@ -24,6 +24,18 @@ def _norm_name(name):
     return s
 
 
+def _ensure_nfl_anytime_td(df):
+    """Computes anytime_td on the fly if missing from cached NFL DataFrames."""
+    if "anytime_td" in df.columns:
+        return df
+    df = df.copy()
+    rush_td_s = df["rushing_tds"].fillna(0) if "rushing_tds" in df.columns else 0
+    rec_td_s = df["receiving_tds"].fillna(0) if "receiving_tds" in df.columns else 0
+    st_td_s = df["special_teams_tds"].fillna(0) if "special_teams_tds" in df.columns else 0
+    df["anytime_td"] = rush_td_s + rec_td_s + st_td_s
+    return df
+
+
 def fetch_live_dk_salaries(sport="NFL"):
     """Fetches live DraftKings main-slate salaries from DK's public lobby & draftables endpoints."""
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -107,6 +119,8 @@ def _parse_uploaded_dfs_csv(custom_csv_df):
 #                   RECENCY-WEIGHTED 100 / 500 REPORT
 # =====================================================================
 def generate_100_500_report(df_2yr, sort_cols, target_col, threshold, entity_mask=None):
+    if target_col == "anytime_td" and "anytime_td" not in df_2yr.columns:
+        df_2yr = _ensure_nfl_anytime_td(df_2yr)
     sub = df_2yr[entity_mask].copy() if entity_mask is not None else df_2yr.copy()
     sub = sub.sort_values(sort_cols).dropna(subset=[target_col])
 
@@ -146,12 +160,7 @@ def build_nfl_context():
     reg_stats = player_stats[player_stats["season_type"] == "REG"].copy()
     reg_stats["sort_key"] = reg_stats["season"] * 100 + reg_stats["week"]
     team_col = "team" if "team" in reg_stats.columns else "recent_team"
-
-    # Anytime Touchdowns scored (rushing + receiving + special teams if present)
-    rush_td_s = reg_stats["rushing_tds"].fillna(0) if "rushing_tds" in reg_stats.columns else 0
-    rec_td_s = reg_stats["receiving_tds"].fillna(0) if "receiving_tds" in reg_stats.columns else 0
-    st_td_s = reg_stats["special_teams_tds"].fillna(0) if "special_teams_tds" in reg_stats.columns else 0
-    reg_stats["anytime_td"] = rush_td_s + rec_td_s + st_td_s
+    reg_stats = _ensure_nfl_anytime_td(reg_stats)
 
     def compute_dfs_points(df):
         def get_col(*names):
@@ -468,6 +477,9 @@ def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manua
         "receptions": ("targets", 2),
     }
     team_col = ctx["team_col"]
+    if stat_col == "anytime_td" and "anytime_td" not in p_logs.columns:
+        p_logs = _ensure_nfl_anytime_td(p_logs)
+
     recent = p_logs.sort_values("sort_key").tail(15).copy()
     full_name = recent["player_display_name"].iloc[-1]
     position = recent["position"].iloc[-1]
@@ -504,7 +516,6 @@ def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manua
 
         total_factor = 1.0 + ((comp_total - 44.0) * 0.0055)
         if stat_col == "anytime_td":
-            # High-total games & favored teams score significantly more TDs
             total_factor = 1.0 + ((comp_total - 44.0) * 0.011)
             script_factor = 1.0 + (team_spread * 0.008)
         elif stat_col == "rushing_yards":
@@ -542,7 +553,6 @@ def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manua
         script_note = "Game Total Est: 44.0 pts"
 
     if stat_col == "anytime_td":
-        # Discrete Poisson simulation for Anytime TD (0.5 threshold => >= 1 TD)
         ewm_td = healthy["anytime_td"].ewm(span=6).mean().iloc[-1]
         season_td = healthy["anytime_td"].mean()
         base_lambda = max(0.04, 0.65 * ewm_td + 0.35 * season_td)

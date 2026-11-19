@@ -17,6 +17,18 @@ st.title("📊 1,000,000-Sim Multi-Sport Prop, Spread & Pro DFS Engine")
 st.caption("NFL • NBA • Men's College Basketball • College Football | Recency-Weighted + Sneaky Blowout Protection")
 
 
+def ensure_nfl_anytime_td(df):
+    """Guarantees anytime_td exists on cached NFL DataFrames."""
+    if "anytime_td" in df.columns:
+        return df
+    df = df.copy()
+    rush_td_s = df["rushing_tds"].fillna(0) if "rushing_tds" in df.columns else 0
+    rec_td_s = df["receiving_tds"].fillna(0) if "receiving_tds" in df.columns else 0
+    st_td_s = df["special_teams_tds"].fillna(0) if "special_teams_tds" in df.columns else 0
+    df["anytime_td"] = rush_td_s + rec_td_s + st_td_s
+    return df
+
+
 def ensure_nba_dk_pts(df):
     """Guarantees DK_PTS exists on cached NBA DataFrames."""
     if "DK_PTS" in df.columns:
@@ -243,7 +255,9 @@ def render_tiered_attd_plays(candidates, max_tiers=6):
 
 @st.cache_resource(show_spinner="Loading NFL 2-year stats, live rosters, depth charts & IR/injuries...")
 def get_nfl():
-    return pro_sim.build_nfl_context()
+    ctx = pro_sim.build_nfl_context()
+    ctx["reg_stats"] = ensure_nfl_anytime_td(ctx["reg_stats"])
+    return ctx
 
 
 @st.cache_resource(show_spinner="Loading NBA 2-year stats & live slate...")
@@ -273,6 +287,7 @@ sport_tab = st.sidebar.radio(
 # =====================================================================
 if sport_tab == "🏈 NFL":
     ctx = get_nfl()
+    ctx["reg_stats"] = ensure_nfl_anytime_td(ctx["reg_stats"])
     reg_stats = ctx["reg_stats"]
     team_col = ctx["team_col"]
     matchup_map = ctx["matchup_map"]
@@ -545,7 +560,6 @@ if sport_tab == "🏈 NFL":
                 if len(p_logs) < 3:
                     continue
 
-                # Require meaningful offensive snap/touch involvement
                 if pos == "QB":
                     recent_att = p_logs["attempts"].tail(4).mean() if "attempts" in p_logs.columns else 0
                     recent_rush_td = p_logs["rushing_tds"].tail(6).mean() if "rushing_tds" in p_logs.columns else 0
