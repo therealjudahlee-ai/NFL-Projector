@@ -1,4 +1,5 @@
 from datetime import datetime
+import itertools
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -50,6 +51,86 @@ def ensure_nba_dk_pts(df):
     return df
 
 
+def render_parlay_tickets(legs, n_legs, max_parlays, is_single_game=False, sport_label="NFL"):
+    """Builds and renders cleanly separated Parlay Ticket Cards with per-leg tables."""
+    if len(legs) < n_legs:
+        st.warning(
+            f"Found {len(legs)} qualifying leg(s), which is fewer than the {n_legs} legs needed per parlay. "
+            "Try lowering Min Hit Rate % or Line Aggressiveness."
+        )
+        return
+
+    # Build top correlated, distinct-player parlays
+    candidate_pool = legs[:18]
+    parlays = []
+    used_sigs = set()
+
+    for combo in itertools.combinations(candidate_pool, n_legs):
+        players = [x["player"] for x in combo]
+        if len(set(players)) < n_legs:
+            continue
+
+        # In TNF / Single-Game mode, ensure all legs come from the same game
+        if is_single_game and len({x["game"] for x in combo}) > 1:
+            continue
+
+        sig = tuple(sorted(f"{x['player']}_{x['stat']}" for x in combo))
+        if sig in used_sigs:
+            continue
+        used_sigs.add(sig)
+
+        comb_prob = float(np.prod([x["over_prob"] for x in combo]))
+
+        # Apply positive correlation boost if QB passing + teammate receiving are paired in same game
+        if sport_label == "NFL":
+            for qb_leg in [x for x in combo if x.get("position") == "QB" and x["stat"] == "passing_yards"]:
+                has_stack = any(
+                    x["team"] == qb_leg["team"]
+                    and x.get("position") in ["WR", "TE"]
+                    and x["stat"] in ["receiving_yards", "receptions"]
+                    for x in combo
+                )
+                if has_stack:
+                    comb_prob = min(0.95, comb_prob * 1.06)
+                    break
+
+        parlays.append((comb_prob, combo))
+
+    parlays.sort(key=lambda item: item[0], reverse=True)
+    top_parlays = parlays[:max_parlays]
+
+    if not top_parlays:
+        st.warning("Could not form valid multi-player parlays from the qualifying legs. Try reducing Legs per Parlay.")
+        return
+
+    st.markdown(f"### 🎟️ Top {len(top_parlays)} Recommended {n_legs}-Leg Parlay Tickets")
+
+    for idx, (comb_prob, combo) in enumerate(top_parlays, start=1):
+        fair_payout = round(1.0 / max(comb_prob, 0.01), 2)
+        matchup_title = combo[0]["game"] if is_single_game else f"{len({x['game'] for x in combo})}-Game Slate"
+
+        with st.container(border=True):
+            h1, h2, h3 = st.columns([2, 1, 1])
+            h1.markdown(f"#### 🎫 Parlay Ticket #{idx} — {matchup_title}")
+            h2.metric("Combined Hit Prob", f"{comb_prob:.1%}")
+            h3.metric("Fair Payout", f"{fair_payout:.2f}x")
+
+            ticket_rows = []
+            for leg_i, lg in enumerate(combo, start=1):
+                ticket_rows.append({
+                    "Leg": f"Leg {leg_i}",
+                    "Player": lg["player"],
+                    "Team": lg["team"],
+                    "Matchup": lg["game"],
+                    "Pick": f"OVER {lg['line']} {lg['stat'].upper()}",
+                    "Median Proj": round(lg["proj"], 1),
+                    "Single-Leg Prob": f"{lg['over_prob']:.1%}",
+                    "Consistency": f"{lg['consistency']:.0%}",
+                    "Context Flags": lg["flags"],
+                })
+            st.dataframe(pd.DataFrame(ticket_rows), use_container_width=True, hide_index=True)
+
+
 @st.cache_resource(show_spinner="Loading NFL 2-year stats, live rosters, depth charts & IR/injuries...")
 def get_nfl():
     return pro_sim.build_nfl_context()
@@ -89,7 +170,7 @@ if sport_tab == "🏈 NFL":
     st.subheader(f"NFL Season {ctx['season']} — Week {ctx['week']}")
     mode = st.tabs([
         "Single Player Prop",
-        "Auto Parlay Builder",
+        "Auto Multi-Leg Parlay Builder",
         "2x–3x Value Finder (100/500 Report)",
         "🏆 Pro NFL DFS Optimizer",
     ])
@@ -121,69 +202,131 @@ if sport_tab == "🏈 NFL":
                 st.info(f"**Matchup:** {res['game']} | **Script:** {res['script_note']} | **Flags:** {res['flags']}")
 
     with mode[1]:
-        c1, c2, c3, c4 = st.columns(4)
-        min_hr = c1.slider("Min Hit Rate %", 55, 95, 75) / 100.0
-        n_legs = c2.selectbox("Parlay Legs", [2, 3, 4], index=1)
-        disc = c3.slider("Line Aggressiveness", 0.70, 1.05, 0.85, 0.05)
-        skip_bo = c4.checkbox("Skip Blowout-Risk Games", value=True, key="nfl_bo1")
+        st.markdown("### 🎰 NFL Multi-Leg Parlay & TNF SGP Builder")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        min_hr = c1.slider("Min Hit Rate % / Leg", 55, 95, 72, key="nfl_hr") / 100.0
+        n_legs = c2.selectbox("Legs per Parlay", [2, 3, 4, 5], index=1, key="nfl_nlegs")
+        max_tickets = c3.slider("Max Parlay Tickets", 1, 10, 5, key="nfl_max_tix")
+        disc = c4.slider("Line Aggressiveness", 0.70, 1.05, 0.85, 0.05, key="nfl_disc")
+        skip_bo = c5.checkbox("Skip Blowout Games", value=False, key="nfl_bo1")
 
-        if st.button("Scan NFL Slate & Build Parlays", key="nfl_parlay"):
+        slate_scope = st.radio(
+            "Game Filter",
+            ["🌙 Thursday Night Football (TNF SGP)", "🏈 Full Week Slate"],
+            horizontal=True,
+            key="nfl_parlay_scope",
+        )
+
+        tnf_teams = {t for t, info in matchup_map.items() if info.get("is_thursday")}
+        is_tnf_mode = "Thursday" in slate_scope
+        if is_tnf_mode:
+            if tnf_teams:
+                tnf_label = next(matchup_map[t]["game_label"] for t in tnf_teams)
+                st.info(f"**Tonight's TNF Matchup:** {tnf_label} (Short-week road fatigue & live IR filters active)")
+            else:
+                st.warning("No Thursday Night Football game found in this week's schedule. Switch to **Full Week Slate** to scan all games.")
+
+        if st.button("🚀 Build Recommended NFL Parlays", key="nfl_parlay", type="primary"):
             recent_pool = reg_stats[
-                (reg_stats["season"] == ctx["season"]) & (reg_stats["week"] >= max(1, ctx["week"] - 3))
+                (reg_stats["season"] == ctx["season"]) & (reg_stats["week"] >= max(1, ctx["week"] - 4))
             ]
             active = recent_pool[["player_id", "player_display_name", "position", team_col]].drop_duplicates(subset=["player_id"])
-            vol_map = {"passing_yards": ("attempts", 8), "rushing_yards": ("carries", 4), "receiving_yards": ("targets", 2), "receptions": ("targets", 2)}
-            pos_props = {"QB": ["passing_yards"], "RB": ["rushing_yards", "receiving_yards"], "WR": ["receiving_yards", "receptions"], "TE": ["receiving_yards", "receptions"]}
+            vol_map = {
+                "passing_yards": ("attempts", 8),
+                "rushing_yards": ("carries", 4),
+                "receiving_yards": ("targets", 2),
+                "receptions": ("targets", 2),
+            }
+            pos_props = {
+                "QB": ["passing_yards", "rushing_yards"],
+                "RB": ["rushing_yards", "receiving_yards"],
+                "WR": ["receiving_yards", "receptions"],
+                "TE": ["receiving_yards", "receptions"],
+            }
 
             legs = []
             for _, p in active.iterrows():
-                if pro_sim._norm_name(p["player_display_name"]) in ctx["out_players"]:
+                p_norm = pro_sim._norm_name(p["player_display_name"])
+                if p_norm in ctx["out_players"]:
                     continue
-                t, pos = p[team_col], p["position"]
+
+                if ctx.get("active_roster_team"):
+                    if p_norm not in ctx["active_roster_team"]:
+                        continue
+                    t = ctx["active_roster_team"][p_norm]
+                else:
+                    t = p[team_col]
+
+                pos = p["position"]
                 if t not in matchup_map or pos not in pos_props:
+                    continue
+                if is_tnf_mode and tnf_teams and t not in tnf_teams:
                     continue
                 if skip_bo and matchup_map[t]["blowout_prob"] >= 0.35:
                     continue
+
                 p_logs = reg_stats[reg_stats["player_id"] == p["player_id"]].sort_values("sort_key")
-                if len(p_logs) < 4:
+                if len(p_logs) < 3:
                     continue
+
+                if pos == "QB":
+                    recent_att = p_logs["attempts"].tail(4).mean() if "attempts" in p_logs.columns else 0
+                    if recent_att < 20.0:
+                        continue
+
                 for st_col in pos_props[pos]:
                     v_col, m_vol = vol_map[st_col]
                     h = p_logs[p_logs[v_col] >= m_vol].tail(10)
                     if len(h) < 4:
                         continue
                     avg = h[st_col].mean()
-                    if (st_col != "receptions" and avg < 18) or (st_col == "receptions" and avg < 3.5):
+                    if (st_col != "receptions" and avg < 16) or (st_col == "receptions" and avg < 3.0):
                         continue
-                    res = pro_sim.simulate_nfl_prop(ctx, p_logs, matchup_map[t]["opponent"], st_col, np.floor(avg * disc) + 0.5)
+                    res = pro_sim.simulate_nfl_prop(
+                        ctx,
+                        p_logs,
+                        matchup_map[t]["opponent"],
+                        st_col,
+                        np.floor(avg * disc) + 0.5,
+                        override_team=t,
+                    )
                     if res["over_prob"] >= min_hr:
                         legs.append(res)
 
             legs.sort(key=lambda x: x["over_prob"], reverse=True)
+            render_parlay_tickets(legs, n_legs=n_legs, max_parlays=max_tickets, is_single_game=is_tnf_mode, sport_label="NFL")
+
             if legs:
-                df_out = pd.DataFrame(legs)[["player", "team", "game", "stat", "line", "proj", "over_prob", "consistency", "flags"]]
-                df_out["over_prob"] = df_out["over_prob"].map(lambda x: f"{x:.1%}")
-                df_out["consistency"] = df_out["consistency"].map(lambda x: f"{x:.0%}")
-                st.dataframe(df_out, use_container_width=True)
-            else:
-                st.warning("No legs met your threshold. Lower the Hit Rate % or Line Aggressiveness.")
+                with st.expander("📋 View All Qualifying Individual Player Legs"):
+                    df_out = pd.DataFrame(legs)[["player", "position", "team", "game", "stat", "line", "proj", "over_prob", "consistency", "flags"]]
+                    df_out["over_prob"] = df_out["over_prob"].map(lambda x: f"{x:.1%}")
+                    df_out["consistency"] = df_out["consistency"].map(lambda x: f"{x:.0%}")
+                    st.dataframe(df_out, use_container_width=True, hide_index=True)
 
     with mode[2]:
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         p_min = c1.slider("Min Hit Rate %", 20, 45, 30, key="nfl_v1") / 100.0
         p_max = c2.slider("Max Hit Rate %", 35, 60, 50, key="nfl_v2") / 100.0
-        skip_bo_v = c3.checkbox("Skip Blowout-Risk Games", value=True, key="nfl_bo2")
+        val_scope = c3.selectbox("Game Filter", ["Full Week Slate", "🌙 Thursday Night Football Only"], key="nfl_val_scope")
+        skip_bo_v = c4.checkbox("Skip Blowout-Risk Games", value=False, key="nfl_bo2")
 
         if st.button("Find 2x–3x Value Plays + 100/500 Report", key="nfl_val"):
-            recent_pool = reg_stats[(reg_stats["season"] == ctx["season"]) & (reg_stats["week"] >= max(1, ctx["week"] - 3))]
+            recent_pool = reg_stats[(reg_stats["season"] == ctx["season"]) & (reg_stats["week"] >= max(1, ctx["week"] - 4))]
             active = recent_pool[["player_id", "player_display_name", "position", team_col]].drop_duplicates(subset=["player_id"])
             vol_map = {"passing_yards": ("attempts", 10), "rushing_yards": ("carries", 5), "receiving_yards": ("targets", 3), "receptions": ("targets", 3)}
             pos_props = {"QB": ["passing_yards"], "RB": ["rushing_yards", "receiving_yards"], "WR": ["receiving_yards", "receptions"], "TE": ["receiving_yards", "receptions"]}
+            tnf_teams_v = {t for t, info in matchup_map.items() if info.get("is_thursday")}
 
             rows = []
             for _, p in active.iterrows():
-                t, pos = p[team_col], p["position"]
+                p_norm = pro_sim._norm_name(p["player_display_name"])
+                if p_norm in ctx["out_players"]:
+                    continue
+                t = ctx["active_roster_team"].get(p_norm, p[team_col]) if ctx.get("active_roster_team") else p[team_col]
+                pos = p["position"]
                 if t not in matchup_map or pos not in pos_props:
+                    continue
+                if "Thursday" in val_scope and tnf_teams_v and t not in tnf_teams_v:
                     continue
                 if skip_bo_v and matchup_map[t]["blowout_prob"] >= 0.35:
                     continue
@@ -200,12 +343,13 @@ if sport_tab == "🏈 NFL":
                         continue
                     for mult in [1.15, 1.28]:
                         alt_line = np.floor(rec_avg * mult) + 0.5
-                        res = pro_sim.simulate_nfl_prop(ctx, p_logs, matchup_map[t]["opponent"], st_col, alt_line)
+                        res = pro_sim.simulate_nfl_prop(ctx, p_logs, matchup_map[t]["opponent"], st_col, alt_line, override_team=t)
                         if p_min <= res["over_prob"] <= p_max:
                             rep = pro_sim.generate_100_500_report(reg_stats, ["season", "week"], st_col, alt_line, reg_stats["player_display_name"] == res["player"])
                             rows.append({
                                 "Player": res["player"],
                                 "Team": res["team"],
+                                "Matchup": res["game"],
                                 "Stat": st_col,
                                 "Alt Line": alt_line,
                                 "Sim Prob": f"{res['over_prob']:.1%}",
@@ -215,7 +359,7 @@ if sport_tab == "🏈 NFL":
                                 "Flags": res["flags"],
                             })
             if rows:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
             else:
                 st.warning("No NFL props matched that 30%–50% window.")
 
@@ -293,13 +437,14 @@ if sport_tab == "🏈 NFL":
                     cap = 50000 if site_code == "DK" else 60000
                     export_rows = []
                     for idx, lu in enumerate(lineups, start=1):
-                        st.markdown(
-                            f"**Lineup #{idx}** — Salary: `${lu['salary'].sum():,} / ${cap:,}` | "
-                            f"Median: `{lu['proj'].sum():.1f} pts` | Ceiling: `{lu['ceiling'].sum():.1f} pts` | "
-                            f"Cumulative Own: `{lu['est_own'].sum():.1f}%`"
-                        )
-                        disp = lu[["slot", "name", "pos", "team", "game", "salary", "proj", "ceiling", "est_own", "value", "flags"]]
-                        st.dataframe(disp, use_container_width=True, hide_index=True)
+                        with st.container(border=True):
+                            st.markdown(
+                                f"#### 🏆 Optimal {site_code} Lineup #{idx} — Salary: `${lu['salary'].sum():,} / ${cap:,}` | "
+                                f"Median: `{lu['proj'].sum():.1f} pts` | Ceiling: `{lu['ceiling'].sum():.1f} pts` | "
+                                f"Cumulative Own: `{lu['est_own'].sum():.1f}%`"
+                            )
+                            disp = lu[["slot", "name", "pos", "team", "game", "salary", "proj", "ceiling", "est_own", "value", "flags"]]
+                            st.dataframe(disp, use_container_width=True, hide_index=True)
 
                         qbs = lu[lu["pos"] == "QB"]["dk_id"].tolist()
                         rbs = lu[lu["slot"] == "RB"]["dk_id"].tolist()
@@ -340,7 +485,7 @@ elif sport_tab == "🏀 NBA":
     st.subheader(f"NBA Season {ctx['curr_szn']} — {slate_date} ({len(ctx['todays_games'])} Games)")
     mode = st.tabs([
         "Single Player Prop",
-        "Auto Parlay Builder",
+        "Auto Multi-Leg Parlay Builder",
         "2x–3x Value Finder (100/500 Report)",
         "🏆 NBA DFS Optimizer ($50k)",
     ])
@@ -369,12 +514,15 @@ elif sport_tab == "🏀 NBA":
                 st.info(f"**Matchup:** {res['game']} | **Script:** {res['script_note']} | **Flags:** {res['flags']}")
 
     with mode[1]:
-        c1, c2, c3 = st.columns(3)
-        min_hr = c1.slider("Min Hit Rate %", 55, 95, 75, key="nba_hr") / 100.0
-        disc = c2.slider("Line Aggressiveness", 0.70, 1.05, 0.85, 0.05, key="nba_disc")
-        skip_bo = c3.checkbox("Skip Blowout-Risk Games", value=True, key="nba_bo1")
+        st.markdown("### 🎰 NBA Multi-Leg Parlay Builder")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        min_hr = c1.slider("Min Hit Rate % / Leg", 55, 95, 75, key="nba_hr") / 100.0
+        nba_n_legs = c2.selectbox("Legs per Parlay", [2, 3, 4, 5], index=1, key="nba_nlegs")
+        nba_max_tix = c3.slider("Max Parlay Tickets", 1, 10, 5, key="nba_max_tix")
+        disc = c4.slider("Line Aggressiveness", 0.70, 1.05, 0.85, 0.05, key="nba_disc")
+        skip_bo = c5.checkbox("Skip Blowout Games", value=True, key="nba_bo1")
 
-        if st.button("Scan Today's NBA Slate", key="nba_parlay"):
+        if st.button("🚀 Build Recommended NBA Parlays", key="nba_parlay", type="primary"):
             cutoff = nba_df["GAME_DATE"].max() - pd.Timedelta(days=14)
             active_ids = nba_df[nba_df["GAME_DATE"] >= cutoff]["PLAYER_ID"].unique()
             legs = []
@@ -397,13 +545,14 @@ elif sport_tab == "🏀 NBA":
                         legs.append(res)
 
             legs.sort(key=lambda x: x["over_prob"], reverse=True)
+            render_parlay_tickets(legs, n_legs=nba_n_legs, max_parlays=nba_max_tix, is_single_game=False, sport_label="NBA")
+
             if legs:
-                df_out = pd.DataFrame(legs)[["player", "team", "game", "stat", "line", "proj", "over_prob", "consistency", "flags"]]
-                df_out["over_prob"] = df_out["over_prob"].map(lambda x: f"{x:.1%}")
-                df_out["consistency"] = df_out["consistency"].map(lambda x: f"{x:.0%}")
-                st.dataframe(df_out, use_container_width=True)
-            else:
-                st.warning("No NBA props met your filter today.")
+                with st.expander("📋 View All Qualifying Individual NBA Player Legs"):
+                    df_out = pd.DataFrame(legs)[["player", "team", "game", "stat", "line", "proj", "over_prob", "consistency", "flags"]]
+                    df_out["over_prob"] = df_out["over_prob"].map(lambda x: f"{x:.1%}")
+                    df_out["consistency"] = df_out["consistency"].map(lambda x: f"{x:.0%}")
+                    st.dataframe(df_out, use_container_width=True, hide_index=True)
 
     with mode[2]:
         c1, c2, c3 = st.columns(3)
@@ -446,7 +595,7 @@ elif sport_tab == "🏀 NBA":
                                 "Flags": res["flags"],
                             })
             if rows:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
             else:
                 st.warning("No NBA props matched that 30%–50% window.")
 
@@ -501,11 +650,12 @@ elif sport_tab == "🏀 NBA":
                     st.error("No valid NBA lineups found with those locks. Try removing a locked player.")
                 else:
                     for idx, lu in enumerate(lus, start=1):
-                        st.markdown(
-                            f"**NBA Lineup #{idx}** — Salary: `${lu['salary'].sum():,} / $50,000` | "
-                            f"Median DK Pts: `{lu['proj'].sum():.1f}` | Ceiling: `{lu['ceiling'].sum():.1f}`"
-                        )
-                        st.dataframe(lu[["slot", "name", "team", "game", "salary", "proj", "ceiling", "est_own", "value", "flags"]], use_container_width=True, hide_index=True)
+                        with st.container(border=True):
+                            st.markdown(
+                                f"#### 🏆 Optimal NBA Lineup #{idx} — Salary: `${lu['salary'].sum():,} / $50,000` | "
+                                f"Median DK Pts: `{lu['proj'].sum():.1f}` | Ceiling: `{lu['ceiling'].sum():.1f}`"
+                            )
+                            st.dataframe(lu[["slot", "name", "team", "game", "salary", "proj", "ceiling", "est_own", "value", "flags"]], use_container_width=True, hide_index=True)
 
         if not nba_pool.empty:
             with st.expander("📋 View Full Projected NBA Player Pool, Ownership & Leverage"):
@@ -548,12 +698,12 @@ elif sport_tab == "🎓 Men's College Basketball":
             st.markdown("### 🐕 Tight-Spread Underdog Outright Win Probabilities (Spread ≤ 3.5)")
             df_dogs = pd.DataFrame(tight_dog_rows).sort_values("Outright Win %", ascending=False)
             df_dogs["Outright Win %"] = df_dogs["Outright Win %"].map(lambda x: f"{x:.1%}")
-            st.dataframe(df_dogs, use_container_width=True)
+            st.dataframe(df_dogs, use_container_width=True, hide_index=True)
 
         if rows:
             st.markdown("### 📊 Full D1 Slate Spread & Blowout Projections")
             df_cbb = pd.DataFrame(rows).sort_values("Edge (Pts)", ascending=False)
-            st.dataframe(df_cbb, use_container_width=True)
+            st.dataframe(df_cbb, use_container_width=True, hide_index=True)
         else:
             st.warning("No D1 games found on ESPN scoreboard for this date.")
 
@@ -580,6 +730,6 @@ elif sport_tab == "🏟️ College Football":
             })
         if rows:
             df_cfb = pd.DataFrame(rows).sort_values("Edge (Pts)", ascending=False)
-            st.dataframe(df_cfb, use_container_width=True)
+            st.dataframe(df_cfb, use_container_width=True, hide_index=True)
         else:
             st.warning("No upcoming FBS games found on ESPN scoreboard.")
