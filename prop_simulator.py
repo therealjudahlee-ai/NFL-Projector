@@ -336,6 +336,7 @@ def build_nfl_context():
     curr_sched = schedules[schedules["season"] == current_season]
     wk_games = curr_sched[curr_sched["week"] == current_week].copy()
     matchup_map = {}
+    today_str = datetime.now().strftime("%Y-%m-%d")
 
     for _, game in wk_games.iterrows():
         home, away = game["home_team"], game["away_team"]
@@ -346,8 +347,15 @@ def build_nfl_context():
         roof = str(game.get("roof", "outdoors")).lower()
         wind = float(game.get("wind", 0)) if pd.notna(game.get("wind", np.nan)) else 0.0
         temp = float(game.get("temp", 65)) if pd.notna(game.get("temp", np.nan)) else 65.0
-        gameday = str(game.get("gameday", "Sunday"))
-        is_thursday = "thursday" in gameday.lower()
+
+        # Check both 'weekday' column ('Thursday') and 'gameday' date string ('2026-11-19')
+        weekday_str = str(game.get("weekday", "")).lower()
+        gameday_str = str(game.get("gameday", "")).strip()
+        is_thursday = (
+            ("thursday" in weekday_str)
+            or ("thursday" in gameday_str.lower())
+            or (gameday_str == today_str and datetime.now().weekday() == 3)
+        )
 
         comp_home_pts = (team_off_pts.get(home, 22.0) + team_def_pts.get(away, 22.0)) / 2.0
         comp_away_pts = (team_off_pts.get(away, 22.0) + team_def_pts.get(home, 22.0)) / 2.0

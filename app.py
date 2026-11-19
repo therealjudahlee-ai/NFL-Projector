@@ -52,36 +52,33 @@ def ensure_nba_dk_pts(df):
 
 
 def render_parlay_tickets(legs, n_legs, max_parlays, is_single_game=False, sport_label="NFL"):
-    """Builds and renders cleanly separated Parlay Ticket Cards with per-leg tables."""
-    if len(legs) < n_legs:
+    """Builds and renders tiered, cleanly separated Parlay Ticket Cards."""
+    # Deduplicate to 1 best prop per player first so tickets never repeat the same player
+    best_per_player = []
+    seen_p = set()
+    for lg in sorted(legs, key=lambda x: x["over_prob"], reverse=True):
+        if lg["player"] not in seen_p:
+            seen_p.add(lg["player"])
+            best_per_player.append(lg)
+
+    if len(best_per_player) < n_legs:
         st.warning(
-            f"Found {len(legs)} qualifying leg(s), which is fewer than the {n_legs} legs needed per parlay. "
+            f"Found {len(best_per_player)} distinct player leg(s), which is fewer than the {n_legs} legs needed per parlay. "
             "Try lowering Min Hit Rate % or Line Aggressiveness."
         )
         return
 
-    # Build top correlated, distinct-player parlays
-    candidate_pool = legs[:18]
-    parlays = []
-    used_sigs = set()
+    candidate_pool = best_per_player[:20]
+    scored_combos = []
 
     for combo in itertools.combinations(candidate_pool, n_legs):
-        players = [x["player"] for x in combo]
-        if len(set(players)) < n_legs:
-            continue
-
-        # In TNF / Single-Game mode, ensure all legs come from the same game
         if is_single_game and len({x["game"] for x in combo}) > 1:
             continue
 
-        sig = tuple(sorted(f"{x['player']}_{x['stat']}" for x in combo))
-        if sig in used_sigs:
-            continue
-        used_sigs.add(sig)
+        raw_prob = float(np.prod([x["over_prob"] for x in combo]))
+        corr_boost = 1.0
+        is_correlated = False
 
-        comb_prob = float(np.prod([x["over_prob"] for x in combo]))
-
-        # Apply positive correlation boost if QB passing + teammate receiving are paired in same game
         if sport_label == "NFL":
             for qb_leg in [x for x in combo if x.get("position") == "QB" and x["stat"] == "passing_yards"]:
                 has_stack = any(
@@ -91,27 +88,65 @@ def render_parlay_tickets(legs, n_legs, max_parlays, is_single_game=False, sport
                     for x in combo
                 )
                 if has_stack:
-                    comb_prob = min(0.95, comb_prob * 1.06)
+                    corr_boost = 1.06
+                    is_correlated = True
                     break
 
-        parlays.append((comb_prob, combo))
+        adj_prob = min(0.95, raw_prob * corr_boost)
+        avg_consistency = float(np.mean([x["consistency"] for x in combo]))
+        rank_score = adj_prob * (0.85 + 0.15 * avg_consistency)
+        scored_combos.append((rank_score, adj_prob, is_correlated, combo))
 
-    parlays.sort(key=lambda item: item[0], reverse=True)
-    top_parlays = parlays[:max_parlays]
+    scored_combos.sort(key=lambda item: item[0], reverse=True)
 
-    if not top_parlays:
-        st.warning("Could not form valid multi-player parlays from the qualifying legs. Try reducing Legs per Parlay.")
+    # Select diverse tickets (limit how many times any single player can appear across tickets)
+    selected_tickets = []
+    player_usage = {}
+    max_reuse = 2 if is_single_game else 1
+
+    for rank_score, adj_prob, is_corr, combo in scored_combos:
+        if any(player_usage.get(x["player"], 0) >= max_reuse for x in combo):
+            continue
+        for x in combo:
+            player_usage[x["player"]] = player_usage.get(x["player"], 0) + 1
+        selected_tickets.append((adj_prob, is_corr, combo))
+        if len(selected_tickets) >= max_parlays:
+            break
+
+    # Fallback if strict diversity cap yielded fewer than max_parlays
+    if len(selected_tickets) < max_parlays:
+        used_sigs = {tuple(sorted(x["player"] for x in t[2])) for t in selected_tickets}
+        for rank_score, adj_prob, is_corr, combo in scored_combos:
+            sig = tuple(sorted(x["player"] for x in combo))
+            if sig in used_sigs:
+                continue
+            used_sigs.add(sig)
+            selected_tickets.append((adj_prob, is_corr, combo))
+            if len(selected_tickets) >= max_parlays:
+                break
+
+    if not selected_tickets:
+        st.warning("Could not form valid parlays from the qualifying legs. Try reducing Legs per Parlay.")
         return
 
-    st.markdown(f"### 🎟️ Top {len(top_parlays)} Recommended {n_legs}-Leg Parlay Tickets")
+    tier_labels = [
+        "🥇 TIER 1 — TOP ANCHOR PARLAY (Highest Hit Probability)",
+        "🥈 TIER 2 — PRIME CORRELATED / VALUE PARLAY",
+        "🥉 TIER 3 — DIVERSIFIED SECONDARY PARLAY",
+    ]
 
-    for idx, (comb_prob, combo) in enumerate(top_parlays, start=1):
+    st.markdown(f"### 🎟️ Tiered Recommended {n_legs}-Leg Parlays ({len(selected_tickets)} Tickets)")
+
+    for idx, (comb_prob, is_corr, combo) in enumerate(selected_tickets, start=1):
         fair_payout = round(1.0 / max(comb_prob, 0.01), 2)
         matchup_title = combo[0]["game"] if is_single_game else f"{len({x['game'] for x in combo})}-Game Slate"
+        tier_title = tier_labels[idx - 1] if idx <= 3 else f"🎯 TIER {idx} — ALTERNATE COMBINATION"
+        stack_badge = " • 🔗 QB+Receiver Correlated" if is_corr else ""
 
         with st.container(border=True):
-            h1, h2, h3 = st.columns([2, 1, 1])
-            h1.markdown(f"#### 🎫 Parlay Ticket #{idx} — {matchup_title}")
+            st.caption(f"**{tier_title}**{stack_badge}")
+            h1, h2, h3 = st.columns([2.2, 1, 1])
+            h1.markdown(f"#### 🎫 Ticket #{idx} — {matchup_title}")
             h2.metric("Combined Hit Prob", f"{comb_prob:.1%}")
             h3.metric("Fair Payout", f"{fair_payout:.2f}x")
 
@@ -120,13 +155,14 @@ def render_parlay_tickets(legs, n_legs, max_parlays, is_single_game=False, sport
                 ticket_rows.append({
                     "Leg": f"Leg {leg_i}",
                     "Player": lg["player"],
+                    "Pos": lg.get("position", "-"),
                     "Team": lg["team"],
                     "Matchup": lg["game"],
                     "Pick": f"OVER {lg['line']} {lg['stat'].upper()}",
                     "Median Proj": round(lg["proj"], 1),
-                    "Single-Leg Prob": f"{lg['over_prob']:.1%}",
+                    "Hit Prob": f"{lg['over_prob']:.1%}",
                     "Consistency": f"{lg['consistency']:.0%}",
-                    "Context Flags": lg["flags"],
+                    "Flags": lg["flags"],
                 })
             st.dataframe(pd.DataFrame(ticket_rows), use_container_width=True, hide_index=True)
 
@@ -202,11 +238,11 @@ if sport_tab == "🏈 NFL":
                 st.info(f"**Matchup:** {res['game']} | **Script:** {res['script_note']} | **Flags:** {res['flags']}")
 
     with mode[1]:
-        st.markdown("### 🎰 NFL Multi-Leg Parlay & TNF SGP Builder")
+        st.markdown("### 🎰 Tiered NFL Multi-Leg Parlay & TNF SGP Builder")
         c1, c2, c3, c4, c5 = st.columns(5)
         min_hr = c1.slider("Min Hit Rate % / Leg", 55, 95, 72, key="nfl_hr") / 100.0
         n_legs = c2.selectbox("Legs per Parlay", [2, 3, 4, 5], index=1, key="nfl_nlegs")
-        max_tickets = c3.slider("Max Parlay Tickets", 1, 10, 5, key="nfl_max_tix")
+        max_tickets = c3.slider("Tiered Tickets to Show", 1, 8, 4, key="nfl_max_tix")
         disc = c4.slider("Line Aggressiveness", 0.70, 1.05, 0.85, 0.05, key="nfl_disc")
         skip_bo = c5.checkbox("Skip Blowout Games", value=False, key="nfl_bo1")
 
@@ -226,7 +262,7 @@ if sport_tab == "🏈 NFL":
             else:
                 st.warning("No Thursday Night Football game found in this week's schedule. Switch to **Full Week Slate** to scan all games.")
 
-        if st.button("🚀 Build Recommended NFL Parlays", key="nfl_parlay", type="primary"):
+        if st.button("🚀 Build Tiered NFL Parlays", key="nfl_parlay", type="primary"):
             recent_pool = reg_stats[
                 (reg_stats["season"] == ctx["season"]) & (reg_stats["week"] >= max(1, ctx["week"] - 4))
             ]
@@ -514,15 +550,15 @@ elif sport_tab == "🏀 NBA":
                 st.info(f"**Matchup:** {res['game']} | **Script:** {res['script_note']} | **Flags:** {res['flags']}")
 
     with mode[1]:
-        st.markdown("### 🎰 NBA Multi-Leg Parlay Builder")
+        st.markdown("### 🎰 Tiered NBA Multi-Leg Parlay Builder")
         c1, c2, c3, c4, c5 = st.columns(5)
         min_hr = c1.slider("Min Hit Rate % / Leg", 55, 95, 75, key="nba_hr") / 100.0
         nba_n_legs = c2.selectbox("Legs per Parlay", [2, 3, 4, 5], index=1, key="nba_nlegs")
-        nba_max_tix = c3.slider("Max Parlay Tickets", 1, 10, 5, key="nba_max_tix")
+        nba_max_tix = c3.slider("Tiered Tickets to Show", 1, 8, 4, key="nba_max_tix")
         disc = c4.slider("Line Aggressiveness", 0.70, 1.05, 0.85, 0.05, key="nba_disc")
         skip_bo = c5.checkbox("Skip Blowout Games", value=True, key="nba_bo1")
 
-        if st.button("🚀 Build Recommended NBA Parlays", key="nba_parlay", type="primary"):
+        if st.button("🚀 Build Tiered NBA Parlays", key="nba_parlay", type="primary"):
             cutoff = nba_df["GAME_DATE"].max() - pd.Timedelta(days=14)
             active_ids = nba_df[nba_df["GAME_DATE"] >= cutoff]["PLAYER_ID"].unique()
             legs = []
