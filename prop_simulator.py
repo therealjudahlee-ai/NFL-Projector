@@ -147,6 +147,12 @@ def build_nfl_context():
     reg_stats["sort_key"] = reg_stats["season"] * 100 + reg_stats["week"]
     team_col = "team" if "team" in reg_stats.columns else "recent_team"
 
+    # Anytime Touchdowns scored (rushing + receiving + special teams if present)
+    rush_td_s = reg_stats["rushing_tds"].fillna(0) if "rushing_tds" in reg_stats.columns else 0
+    rec_td_s = reg_stats["receiving_tds"].fillna(0) if "receiving_tds" in reg_stats.columns else 0
+    st_td_s = reg_stats["special_teams_tds"].fillna(0) if "special_teams_tds" in reg_stats.columns else 0
+    reg_stats["anytime_td"] = rush_td_s + rec_td_s + st_td_s
+
     def compute_dfs_points(df):
         def get_col(*names):
             for name in names:
@@ -417,7 +423,7 @@ def build_nfl_context():
     def_lookup = {}
     all_stats = [
         "passing_yards", "rushing_yards", "receiving_yards", "receptions",
-        "passing_tds", "rushing_tds", "receiving_tds", "dk_points", "fd_points",
+        "passing_tds", "rushing_tds", "receiving_tds", "anytime_td", "dk_points", "fd_points",
     ]
     for pos in ["QB", "RB", "WR", "TE"]:
         pos_df = reg_stats[reg_stats["position"] == pos]
@@ -476,7 +482,10 @@ def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manua
         healthy = recent.tail(12).copy()
 
     h10 = healthy.tail(10)
-    consistency = float(np.mean(h10[stat_col] >= (h10[stat_col].mean() * 0.85))) if not h10.empty else 0.5
+    if stat_col == "anytime_td":
+        consistency = float(np.mean(h10["anytime_td"] >= 1.0)) if not h10.empty else 0.0
+    else:
+        consistency = float(np.mean(h10[stat_col] >= (h10[stat_col].mean() * 0.85))) if not h10.empty else 0.5
 
     def_mult = ctx["def_lookup"].get((opponent_team, position, stat_col), 1.0)
     auto_bump = ctx["team_pos_bump"].get((player_team, position), 1.0) * manual_bump
@@ -494,11 +503,14 @@ def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manua
         sneaky_blowout = game_info["sneaky_blowout"]
 
         total_factor = 1.0 + ((comp_total - 44.0) * 0.0055)
-        script_factor = (
-            1.0 + (-team_spread * 0.006)
-            if stat_col == "rushing_yards"
-            else 1.0 + (team_spread * 0.005)
-        )
+        if stat_col == "anytime_td":
+            # High-total games & favored teams score significantly more TDs
+            total_factor = 1.0 + ((comp_total - 44.0) * 0.011)
+            script_factor = 1.0 + (team_spread * 0.008)
+        elif stat_col == "rushing_yards":
+            script_factor = 1.0 + (-team_spread * 0.006)
+        else:
+            script_factor = 1.0 + (team_spread * 0.005)
 
         if game_info["roof"] in ["outdoors", "open"] and game_info["wind"] >= 15.0:
             if stat_col in ["passing_yards", "receiving_yards", "receptions"]:
@@ -521,7 +533,7 @@ def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manua
             flags.append(f"Teammate Out Bump {auto_bump:.2f}x")
 
         script_mult = float(
-            np.clip(total_factor * script_factor * weather_mult * blowout_penalty * auto_bump, 0.80, 1.25)
+            np.clip(total_factor * script_factor * weather_mult * blowout_penalty * auto_bump, 0.80, 1.30)
         )
         script_note = f"Proj Total: {comp_total:.1f} | Spread: {player_team} {team_spread:+.1f} | Blowout Prob: {blowout_prob:.0%}"
     else:
@@ -529,7 +541,18 @@ def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manua
         script_mult = float(np.clip(auto_bump, 0.85, 1.25))
         script_note = "Game Total Est: 44.0 pts"
 
-    if stat_col in volume_map:
+    if stat_col == "anytime_td":
+        # Discrete Poisson simulation for Anytime TD (0.5 threshold => >= 1 TD)
+        ewm_td = healthy["anytime_td"].ewm(span=6).mean().iloc[-1]
+        season_td = healthy["anytime_td"].mean()
+        base_lambda = max(0.04, 0.65 * ewm_td + 0.35 * season_td)
+        adj_lambda = float(np.clip(base_lambda * def_mult * script_mult, 0.03, 1.65))
+        sims = np.random.poisson(adj_lambda, N_SIMS).astype(np.float32)
+        breakdown = f"Expected TDs: {adj_lambda:.2f}/game (Def: {def_mult:.2f}x | Env: {script_mult:.2f}x)"
+        proj_val = adj_lambda
+        floor_val = float(np.percentile(sims, 20))
+        ceil_val = float(np.percentile(sims, 80))
+    elif stat_col in volume_map:
         vol_col, _ = volume_map[stat_col]
         ewm_vol = healthy[vol_col].ewm(span=4).mean().iloc[-1]
         vol_std = max(healthy[vol_col].std(), 1.0)
@@ -545,12 +568,18 @@ def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manua
         sim_eff = np.clip(np.random.normal(adj_eff, eff_std, N_SIMS).astype(np.float32), 0, None)
         sims = sim_vol * sim_eff
         breakdown = f"{adj_vol:.1f} {vol_col} x {adj_eff:.2f} {stat_col}/{vol_col[:-1]}"
+        proj_val = float(np.median(sims))
+        floor_val = float(np.percentile(sims, 20))
+        ceil_val = float(np.percentile(sims, 80))
     else:
         ewm_avg = healthy[stat_col].ewm(span=4).mean().iloc[-1]
         stat_std = max(healthy[stat_col].std(), 0.5)
         adj_avg = ewm_avg * def_mult * script_mult
         sims = np.clip(np.random.normal(adj_avg, stat_std, N_SIMS).astype(np.float32), 0, None)
         breakdown = f"Weighted Avg: {adj_avg:.2f}"
+        proj_val = float(np.median(sims))
+        floor_val = float(np.percentile(sims, 20))
+        ceil_val = float(np.percentile(sims, 80))
 
     over_prob = float(np.mean(sims > prop_line))
     fair_mult = round(1.0 / over_prob, 2) if over_prob > 0.01 else 99.0
@@ -569,9 +598,9 @@ def simulate_nfl_prop(ctx, p_logs, opponent_team, stat_col, prop_line=0.0, manua
         "flags": " | ".join(flags) if flags else "Clean Environment",
         "stat": stat_col,
         "line": prop_line,
-        "proj": float(np.median(sims)),
-        "floor": float(np.percentile(sims, 20)),
-        "ceiling": float(np.percentile(sims, 80)),
+        "proj": proj_val,
+        "floor": floor_val,
+        "ceiling": ceil_val,
         "over_prob": over_prob,
         "under_prob": float(np.mean(sims < prop_line)),
         "fair_mult": fair_mult,
@@ -1407,12 +1436,12 @@ def run_nfl_menu(nfl_ctx=None):
                 input(f"Opponent Team Abbr [Press Enter for Week {current_week} opp: {auto_opp}]: ").strip().upper()
                 or auto_opp
             )
-            stat = input("Stat (passing_yards, rushing_yards, receiving_yards, receptions, dk_points): ").strip().lower()
+            stat = input("Stat (passing_yards, rushing_yards, receiving_yards, receptions, anytime_td, dk_points): ").strip().lower()
             if stat not in reg_stats.columns:
                 print(f"[!] Invalid stat '{stat}'.")
                 continue
             try:
-                line = float(input("Prop Line (e.g., 245.5): ").strip())
+                line = 0.5 if stat == "anytime_td" else float(input("Prop Line (e.g., 245.5): ").strip())
             except ValueError:
                 print("[!] Invalid number for prop line.")
                 continue
@@ -1426,7 +1455,7 @@ def run_nfl_menu(nfl_ctx=None):
             print(f" Healthy Games:     {res['games_used']} | Consistency Score: {res['consistency']:.0%}")
             print(f" Matchup & Script:  {res['script_note']}")
             print(f" Context Flags:     {res['flags']}")
-            print(f" Median Projection: {res['proj']:.1f}  (Floor: {res['floor']:.1f} | Ceiling: {res['ceiling']:.1f})")
+            print(f" Median Projection: {res['proj']:.2f}  (Floor: {res['floor']:.1f} | Ceiling: {res['ceiling']:.1f})")
             print(f" OVER {res['line']:<5} Prob: {res['over_prob']:.2%}  (Fair Payout: {res['fair_mult']:.2f}x)")
             print("=" * 70)
 

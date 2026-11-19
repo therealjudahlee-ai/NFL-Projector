@@ -170,10 +170,7 @@ def render_tiered_value_plays(candidates, max_tiers=6, sport_label="NFL"):
         st.warning(f"No {sport_label} props matched that 2x–3x probability window. Try widening the Min/Max Hit Rate sliders.")
         return
 
-    # Sort by composite edge score (Sim Prob * Defense Trend * Game Script/Pace)
     sorted_cands = sorted(candidates, key=lambda x: x["value_score"], reverse=True)
-
-    # Keep only the single highest-edge alt line per player so cards stay distinct
     unique_plays = []
     seen_players = set()
     for item in sorted_cands:
@@ -207,6 +204,41 @@ def render_tiered_value_plays(candidates, max_tiers=6, sport_label="NFL"):
             "Sim Prob", "Fair Payout", "Last 100g (Weighted)", "Last 500g (Weighted)", "Flags",
         ]
         st.dataframe(pd.DataFrame(unique_plays)[disp_cols], use_container_width=True, hide_index=True)
+
+
+def render_tiered_attd_plays(candidates, max_tiers=6):
+    """Renders Tier 1 / 2 / 3+ Anytime Touchdown Scorer cards with Sim Prob & Fair Payout."""
+    if not candidates:
+        st.warning("No Anytime TD scorers matched your minimum probability threshold. Try lowering Min Anytime TD %.")
+        return
+
+    sorted_cands = sorted(candidates, key=lambda x: x["rank_score"], reverse=True)
+    top_plays = sorted_cands[:max_tiers]
+    tier_headers = [
+        "🥇 TIER 1 — TOP ANCHOR ANYTIME TD SCORER (Highest Scoring Probability)",
+        "🥈 TIER 2 — PRIME RED-ZONE & MATCHUP TD PLAY",
+        "🥉 TIER 3 — HIGH-UPSIDE / PLUS-MONEY TD VALUE",
+    ]
+
+    st.markdown(f"### 🏈 Tiered Anytime Touchdown Scorers (Top {len(top_plays)} Ranked)")
+
+    for idx, play in enumerate(top_plays, start=1):
+        tier_title = tier_headers[idx - 1] if idx <= 3 else f"🎯 TIER {idx} — SECONDARY ANYTIME TD PLAY"
+        with st.container(border=True):
+            st.caption(f"**{tier_title}** • Matchup: {play['Matchup']}")
+            c1, c2, c3, c4 = st.columns([2.2, 1, 1, 1])
+            c1.markdown(f"#### #{idx} {play['Player']} ({play['Pos']} — {play['Team']}) — ANYTIME TD")
+            c2.metric("Sim ATTD Prob", play["Sim Prob"], f"Exp TDs: {play['Exp TDs']}")
+            c3.metric("Fair Payout", play["Fair Payout"], f"100g: {play['Last 100g (Weighted)']}")
+            c4.metric("500g Weighted", play["Last 500g (Weighted)"], f"Def Trend: {play['Def Trend']}")
+            st.caption(f"**Context Flags:** {play['Flags']}")
+
+    with st.expander("📋 View All Qualifying Anytime TD Scorers (Full Table)"):
+        disp_cols = [
+            "Player", "Pos", "Team", "Matchup", "Exp TDs",
+            "Sim Prob", "Fair Payout", "Last 100g (Weighted)", "Last 500g (Weighted)", "Flags",
+        ]
+        st.dataframe(pd.DataFrame(sorted_cands)[disp_cols], use_container_width=True, hide_index=True)
 
 
 @st.cache_resource(show_spinner="Loading NFL 2-year stats, live rosters, depth charts & IR/injuries...")
@@ -250,6 +282,7 @@ if sport_tab == "🏈 NFL":
         "Single Player Prop",
         "Auto Multi-Leg Parlay Builder",
         "2x–3x Value Finder (100/500 Report)",
+        "🏈 Anytime Touchdown Finder",
         "🏆 Pro NFL DFS Optimizer",
     ])
 
@@ -258,9 +291,9 @@ if sport_tab == "🏈 NFL":
         player_in = col1.text_input("Player Name", value="Josh Allen")
         stat_in = col2.selectbox(
             "Stat",
-            ["passing_yards", "rushing_yards", "receiving_yards", "receptions", "dk_points", "passing_tds", "rushing_tds", "receiving_tds"],
+            ["passing_yards", "rushing_yards", "receiving_yards", "receptions", "anytime_td", "dk_points", "passing_tds", "rushing_tds", "receiving_tds"],
         )
-        line_in = col3.number_input("Prop Line", value=245.5, step=0.5)
+        line_in = col3.number_input("Prop Line", value=0.5 if stat_in == "anytime_td" else 245.5, step=0.5)
         star_out = col4.checkbox("Key Teammate OUT (+8% Usage)")
 
         if st.button("Run 1,000,000 Simulations", key="nfl_single"):
@@ -273,7 +306,7 @@ if sport_tab == "🏈 NFL":
                 res = pro_sim.simulate_nfl_prop(ctx, p_logs, opp, stat_in, line_in, manual_bump=(1.08 if star_out else 1.0))
 
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Median Projection", f"{res['proj']:.1f}", f"Floor {res['floor']:.1f} / Ceil {res['ceiling']:.1f}")
+                c1.metric("Median / Exp Proj", f"{res['proj']:.2f}", f"Floor {res['floor']:.1f} / Ceil {res['ceiling']:.1f}")
                 c2.metric(f"OVER {line_in} Prob", f"{res['over_prob']:.1%}", f"Fair Payout: {res['fair_mult']:.2f}x")
                 c3.metric("Consistency Score", f"{res['consistency']:.0%}", f"{res['games_used']} healthy games")
                 c4.metric("Blowout Risk", f"{res['blowout_prob']:.0%}", "Sneaky Blowout!" if res["sneaky_blowout"] else "Normal")
@@ -468,6 +501,83 @@ if sport_tab == "🏈 NFL":
             render_tiered_value_plays(rows, max_tiers=nfl_val_tiers, sport_label="NFL")
 
     with mode[3]:
+        st.markdown("### 🏈 Tiered NFL Anytime Touchdown Scorer Engine (1,000,000 Sims)")
+        c1, c2, c3, c4 = st.columns(4)
+        min_td_prob = c1.slider("Min Anytime TD %", 15, 70, 32, key="attd_min") / 100.0
+        attd_tiers = c2.slider("Tiered TD Scorers to Show", 2, 12, 6, key="attd_tiers")
+        attd_scope = c3.selectbox(
+            "Game Filter",
+            ["🌙 Thursday Night Football / Single Game", "🏈 Full Week Slate"],
+            key="attd_scope",
+        )
+        include_qb_rush = c4.checkbox("Include Rushing QBs", value=True, key="attd_qb")
+
+        tnf_teams_td = {t for t, info in matchup_map.items() if info.get("is_thursday")}
+        all_game_labels_td = sorted({info["game_label"] for info in matchup_map.values()})
+        attd_single_game = None
+        if "Thursday" in attd_scope:
+            if tnf_teams_td:
+                attd_single_game = next(matchup_map[t]["game_label"] for t in tnf_teams_td)
+                st.info(f"**Tonight's TNF Matchup:** {attd_single_game} (Poisson red-zone & live IR filters active)")
+            elif all_game_labels_td:
+                attd_single_game = st.selectbox("Select Game for Anytime TD Scorers:", all_game_labels_td, key="attd_game_pick")
+
+        if st.button("🚀 Find Tiered Anytime TD Scorers", key="run_attd", type="primary"):
+            recent_pool = reg_stats[
+                (reg_stats["season"] == ctx["season"]) & (reg_stats["week"] >= max(1, ctx["week"] - 4))
+            ]
+            active = recent_pool[["player_id", "player_display_name", "position", team_col]].drop_duplicates(subset=["player_id"])
+            allowed_pos = ["RB", "WR", "TE"] + (["QB"] if include_qb_rush else [])
+
+            td_rows = []
+            for _, p in active.iterrows():
+                p_norm = pro_sim._norm_name(p["player_display_name"])
+                if p_norm in ctx["out_players"]:
+                    continue
+                t = ctx["active_roster_team"].get(p_norm, p[team_col]) if ctx.get("active_roster_team") else p[team_col]
+                pos = p["position"]
+                if t not in matchup_map or pos not in allowed_pos:
+                    continue
+                if "Thursday" in attd_scope and attd_single_game and matchup_map[t]["game_label"] != attd_single_game:
+                    continue
+
+                p_logs = reg_stats[reg_stats["player_id"] == p["player_id"]].sort_values("sort_key")
+                if len(p_logs) < 3:
+                    continue
+
+                # Require meaningful offensive snap/touch involvement
+                if pos == "QB":
+                    recent_att = p_logs["attempts"].tail(4).mean() if "attempts" in p_logs.columns else 0
+                    recent_rush_td = p_logs["rushing_tds"].tail(6).mean() if "rushing_tds" in p_logs.columns else 0
+                    if recent_att < 20.0 or recent_rush_td < 0.20:
+                        continue
+                else:
+                    if p_logs["dk_points"].tail(6).mean() < 5.0:
+                        continue
+
+                res = pro_sim.simulate_nfl_prop(ctx, p_logs, matchup_map[t]["opponent"], "anytime_td", 0.5, override_team=t)
+                if res["over_prob"] >= min_td_prob:
+                    rep = pro_sim.generate_100_500_report(
+                        reg_stats, ["season", "week"], "anytime_td", 0.5, reg_stats["player_display_name"] == res["player"]
+                    )
+                    rank_sc = float(res["over_prob"] * (0.85 + 0.15 * res["def_mult"]))
+                    td_rows.append({
+                        "rank_score": rank_sc,
+                        "Player": res["player"],
+                        "Pos": pos,
+                        "Team": res["team"],
+                        "Matchup": res["game"],
+                        "Exp TDs": f"{res['proj']:.2f}",
+                        "Sim Prob": f"{res['over_prob']:.1%}",
+                        "Fair Payout": f"{res['fair_mult']:.2f}x",
+                        "Def Trend": f"{res['def_mult']:.2f}x",
+                        "Last 100g (Weighted)": f"{rep[100]['weighted_rate']:.1%}",
+                        "Last 500g (Weighted)": f"{rep[500]['weighted_rate']:.1%}",
+                        "Flags": res["flags"],
+                    })
+            render_tiered_attd_plays(td_rows, max_tiers=attd_tiers)
+
+    with mode[4]:
         st.markdown("### 🏆 Pro NFL DFS Lineup Builder (Stacking, Bring-Backs, Leverage & Multi-Lineup)")
         uploaded_csv = st.file_uploader(
             "Upload DraftKings ('DKSalaries.csv') or FanDuel ('FanDuel-NFL.csv') for 100% Exact Slate Prices",
