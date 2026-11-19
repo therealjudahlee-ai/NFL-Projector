@@ -164,6 +164,51 @@ def render_parlay_tickets(legs, n_legs, max_parlays, is_single_game=False, sport
             st.dataframe(pd.DataFrame(ticket_rows), use_container_width=True, hide_index=True)
 
 
+def render_tiered_value_plays(candidates, max_tiers=6, sport_label="NFL"):
+    """Deduplicates to 1 best alt-line play per player and renders Tier 1 / 2 / 3+ cards."""
+    if not candidates:
+        st.warning(f"No {sport_label} props matched that 2x–3x probability window. Try widening the Min/Max Hit Rate sliders.")
+        return
+
+    # Sort by composite edge score (Sim Prob * Defense Trend * Game Script/Pace)
+    sorted_cands = sorted(candidates, key=lambda x: x["value_score"], reverse=True)
+
+    # Keep only the single highest-edge alt line per player so cards stay distinct
+    unique_plays = []
+    seen_players = set()
+    for item in sorted_cands:
+        if item["Player"] not in seen_players:
+            seen_players.add(item["Player"])
+            unique_plays.append(item)
+
+    top_plays = unique_plays[:max_tiers]
+    tier_headers = [
+        "🥇 TIER 1 — TOP 2x–3x ANCHOR VALUE PLAY",
+        "🥈 TIER 2 — PRIME MATCHUP & FORM EDGE",
+        "🥉 TIER 3 — HIGH-UPSIDE VALUE PLAY",
+    ]
+
+    st.markdown(f"### 💎 Tiered {sport_label} 2x–3x Multiplier Plays (Top {len(top_plays)} Ranked)")
+
+    for idx, play in enumerate(top_plays, start=1):
+        tier_title = tier_headers[idx - 1] if idx <= 3 else f"🎯 TIER {idx} — SECONDARY VALUE PLAY"
+        with st.container(border=True):
+            st.caption(f"**{tier_title}** • Matchup: {play['Matchup']}")
+            c1, c2, c3, c4 = st.columns([2.2, 1, 1, 1])
+            c1.markdown(f"#### #{idx} {play['Player']} ({play['Team']}) — OVER {play['Alt Line']} {play['Stat'].upper()}")
+            c2.metric("Sim Hit Prob", play["Sim Prob"], f"Proj: {play['Median Proj']}")
+            c3.metric("Fair Payout", play["Fair Payout"], f"100g: {play['Last 100g (Weighted)']}")
+            c4.metric("500g Weighted", play["Last 500g (Weighted)"], f"Form: {play['Form Trend']}")
+            st.caption(f"**Context Flags:** {play['Flags']}")
+
+    with st.expander("📋 View All Qualifying 2x–3x Value Candidates (Full Table)"):
+        disp_cols = [
+            "Player", "Team", "Matchup", "Stat", "Alt Line", "Median Proj",
+            "Sim Prob", "Fair Payout", "Last 100g (Weighted)", "Last 500g (Weighted)", "Flags",
+        ]
+        st.dataframe(pd.DataFrame(unique_plays)[disp_cols], use_container_width=True, hide_index=True)
+
+
 @st.cache_resource(show_spinner="Loading NFL 2-year stats, live rosters, depth charts & IR/injuries...")
 def get_nfl():
     return pro_sim.build_nfl_context()
@@ -346,11 +391,13 @@ if sport_tab == "🏈 NFL":
                     st.dataframe(df_out, use_container_width=True, hide_index=True)
 
     with mode[2]:
-        c1, c2, c3, c4 = st.columns(4)
+        st.markdown("### 💎 Tiered NFL 2x–3x Multiplier Value Finder")
+        c1, c2, c3, c4, c5 = st.columns(5)
         p_min = c1.slider("Min Hit Rate %", 20, 45, 30, key="nfl_v1") / 100.0
         p_max = c2.slider("Max Hit Rate %", 35, 60, 50, key="nfl_v2") / 100.0
-        val_scope = c3.selectbox("Game Filter", ["Full Week Slate", "🌙 Thursday Night Football / Single Game"], key="nfl_val_scope")
-        skip_bo_v = c4.checkbox("Skip Blowout-Risk Games", value=False, key="nfl_bo2")
+        nfl_val_tiers = c3.slider("Tiered Plays to Show", 2, 10, 6, key="nfl_v_tiers")
+        val_scope = c4.selectbox("Game Filter", ["Full Week Slate", "🌙 Thursday Night Football / Single Game"], key="nfl_val_scope")
+        skip_bo_v = c5.checkbox("Skip Blowout Games", value=False, key="nfl_bo2")
 
         tnf_teams_v = {t for t, info in matchup_map.items() if info.get("is_thursday")}
         all_game_labels_v = sorted({info["game_label"] for info in matchup_map.values()})
@@ -361,7 +408,7 @@ if sport_tab == "🏈 NFL":
             elif all_game_labels_v:
                 val_single_game = st.selectbox("Select Game for Value Finder:", all_game_labels_v, key="nfl_val_game_pick")
 
-        if st.button("Find 2x–3x Value Plays + 100/500 Report", key="nfl_val"):
+        if st.button("🚀 Find Tiered NFL 2x–3x Value Plays", key="nfl_val", type="primary"):
             recent_pool = reg_stats[(reg_stats["season"] == ctx["season"]) & (reg_stats["week"] >= max(1, ctx["week"] - 4))]
             active = recent_pool[["player_id", "player_display_name", "position", team_col]].drop_duplicates(subset=["player_id"])
             vol_map = {"passing_yards": ("attempts", 10), "rushing_yards": ("carries", 5), "receiving_yards": ("targets", 3), "receptions": ("targets", 3)}
@@ -383,12 +430,17 @@ if sport_tab == "🏈 NFL":
                 p_logs = reg_stats[reg_stats["player_id"] == p["player_id"]].sort_values("sort_key")
                 if len(p_logs) < 4:
                     continue
+                if pos == "QB":
+                    recent_att = p_logs["attempts"].tail(4).mean() if "attempts" in p_logs.columns else 0
+                    if recent_att < 20.0:
+                        continue
                 for st_col in pos_props[pos]:
                     v_col, m_vol = vol_map[st_col]
                     h = p_logs[p_logs[v_col] >= m_vol].tail(10)
                     if len(h) < 4:
                         continue
                     rec_avg = h[st_col].tail(4).mean()
+                    two_yr_avg = h[st_col].mean()
                     if (st_col != "receptions" and rec_avg < 20) or (st_col == "receptions" and rec_avg < 3.5):
                         continue
                     for mult in [1.15, 1.28]:
@@ -396,22 +448,24 @@ if sport_tab == "🏈 NFL":
                         res = pro_sim.simulate_nfl_prop(ctx, p_logs, matchup_map[t]["opponent"], st_col, alt_line, override_team=t)
                         if p_min <= res["over_prob"] <= p_max:
                             rep = pro_sim.generate_100_500_report(reg_stats, ["season", "week"], st_col, alt_line, reg_stats["player_display_name"] == res["player"])
+                            form_ratio = rec_avg / max(two_yr_avg, 1.0)
+                            edge_score = float(res["over_prob"] * res["def_mult"] * res["script_mult"] * (0.9 + 0.1 * form_ratio))
                             rows.append({
+                                "value_score": edge_score,
                                 "Player": res["player"],
                                 "Team": res["team"],
                                 "Matchup": res["game"],
                                 "Stat": st_col,
                                 "Alt Line": alt_line,
+                                "Median Proj": round(res["proj"], 1),
                                 "Sim Prob": f"{res['over_prob']:.1%}",
                                 "Fair Payout": f"{res['fair_mult']:.2f}x",
+                                "Form Trend": f"{form_ratio:.2f}x",
                                 "Last 100g (Weighted)": f"{rep[100]['weighted_rate']:.1%}",
                                 "Last 500g (Weighted)": f"{rep[500]['weighted_rate']:.1%}",
                                 "Flags": res["flags"],
                             })
-            if rows:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-            else:
-                st.warning("No NFL props matched that 30%–50% window.")
+            render_tiered_value_plays(rows, max_tiers=nfl_val_tiers, sport_label="NFL")
 
     with mode[3]:
         st.markdown("### 🏆 Pro NFL DFS Lineup Builder (Stacking, Bring-Backs, Leverage & Multi-Lineup)")
@@ -605,12 +659,14 @@ elif sport_tab == "🏀 NBA":
                     st.dataframe(df_out, use_container_width=True, hide_index=True)
 
     with mode[2]:
-        c1, c2, c3 = st.columns(3)
+        st.markdown("### 💎 Tiered NBA 2x–3x Multiplier Value Finder")
+        c1, c2, c3, c4 = st.columns(4)
         p_min = c1.slider("Min Hit Rate %", 20, 45, 30, key="nba_v1") / 100.0
         p_max = c2.slider("Max Hit Rate %", 35, 60, 50, key="nba_v2") / 100.0
-        skip_bo_v = c3.checkbox("Skip Blowout-Risk Games", value=True, key="nba_bo2")
+        nba_val_tiers = c3.slider("Tiered Plays to Show", 2, 10, 6, key="nba_v_tiers")
+        skip_bo_v = c4.checkbox("Skip Blowout-Risk Games", value=True, key="nba_bo2")
 
-        if st.button("Find 2x–3x NBA Value Plays", key="nba_val"):
+        if st.button("🚀 Find Tiered NBA 2x–3x Value Plays", key="nba_val", type="primary"):
             cutoff = nba_df["GAME_DATE"].max() - pd.Timedelta(days=14)
             active_ids = nba_df[nba_df["GAME_DATE"] >= cutoff]["PLAYER_ID"].unique()
             rows = []
@@ -626,6 +682,7 @@ elif sport_tab == "🏀 NBA":
                     continue
                 for st_col in ["PTS", "REB", "AST", "PRA"]:
                     rec_avg = h[st_col].tail(5).mean()
+                    two_yr_avg = h[st_col].mean()
                     if (st_col in ["REB", "AST"] and rec_avg < 4.5) or (st_col == "PTS" and rec_avg < 11.0):
                         continue
                     for mult in [1.12, 1.24]:
@@ -633,21 +690,24 @@ elif sport_tab == "🏀 NBA":
                         res = pro_sim.simulate_nba_prop(ctx, p_logs, matchup_map[t]["opponent"], st_col, alt_line)
                         if p_min <= res["over_prob"] <= p_max:
                             rep = pro_sim.generate_100_500_report(nba_df, ["GAME_DATE"], st_col, alt_line, nba_df["PLAYER_NAME"] == res["player"])
+                            form_ratio = rec_avg / max(two_yr_avg, 1.0)
+                            edge_score = float(res["over_prob"] * res["def_mult"] * res["script_mult"] * (0.9 + 0.1 * form_ratio))
                             rows.append({
+                                "value_score": edge_score,
                                 "Player": res["player"],
                                 "Team": res["team"],
+                                "Matchup": res["game"],
                                 "Stat": st_col,
                                 "Alt Line": alt_line,
+                                "Median Proj": round(res["proj"], 1),
                                 "Sim Prob": f"{res['over_prob']:.1%}",
                                 "Fair Payout": f"{res['fair_mult']:.2f}x",
+                                "Form Trend": f"{form_ratio:.2f}x",
                                 "Last 100g (Weighted)": f"{rep[100]['weighted_rate']:.1%}",
                                 "Last 500g (Weighted)": f"{rep[500]['weighted_rate']:.1%}",
                                 "Flags": res["flags"],
                             })
-            if rows:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-            else:
-                st.warning("No NBA props matched that 30%–50% window.")
+            render_tiered_value_plays(rows, max_tiers=nba_val_tiers, sport_label="NBA")
 
     with mode[3]:
         st.markdown("### 🏆 NBA DFS Lineup Builder (8-Player Roster under $50,000)")
