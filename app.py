@@ -13,8 +13,8 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("📊 1,000,000-Sim Multi-Sport Prop, Spread & Pro DFS Engine")
-st.caption("NFL • NBA • Men's College Basketball • College Football | Recency-Weighted + Sneaky Blowout Protection")
+st.title("📊 1,000,000-Sim Multi-Sport Prop, Game Winner & Pro DFS Engine")
+st.caption("NFL • NBA • Men's College Basketball • College Football | Recency-Weighted + Fatigue & Blowout Protection")
 
 
 def ensure_nfl_anytime_td(df):
@@ -61,6 +61,39 @@ def ensure_nba_dk_pts(df):
         + np.where(dd >= 3, 3.0, 0.0)
     )
     return df
+
+
+def render_tiered_game_winners(games_list, max_tiers=6, sport_label="NFL"):
+    """Renders Tier 1 / 2 / 3+ Straight-Up Game Winner (Moneyline) cards."""
+    if not games_list:
+        st.warning(f"No {sport_label} matchups matched your filter.")
+        return
+
+    top_games = games_list[:max_tiers]
+    tier_headers = [
+        "🥇 TIER 1 — HIGHEST-CONFIDENCE STRAIGHT-UP WINNER",
+        "🥈 TIER 2 — PRIME SITUATIONAL / EFFICIENCY FAVORITE",
+        "🥉 TIER 3 — SOLID MONEYLINE LEAN",
+    ]
+
+    st.markdown(f"### 🏆 Tiered {sport_label} Game Winner Projections (Top {len(top_games)} Ranked)")
+
+    for idx, g in enumerate(top_games, start=1):
+        tier_title = tier_headers[idx - 1] if idx <= 3 else f"🎯 TIER {idx} — MATCHUP LEAN"
+        with st.container(border=True):
+            st.caption(f"**{tier_title}** • {g['Matchup']}")
+            c1, c2, c3, c4 = st.columns([2.2, 1, 1, 1.3])
+            c1.markdown(f"#### #{idx} {g['Projected Winner']} TO WIN")
+            c2.metric("Win Probability", f"{g['Win Prob']:.1%}", f"Fair ML: {g['Fair Moneyline']}")
+            c3.metric("Fair Payout", g["Fair Payout"], f"Home: {g['Home Win %']}")
+            c4.metric("Projected Score", g["Proj Score"], f"Away: {g['Away Win %']}")
+            st.caption(f"**Context & Situational Factors:** {g['Flags']}")
+
+    with st.expander(f"📋 View Full {sport_label} Slate Moneyline Board"):
+        df_g = pd.DataFrame(games_list).copy()
+        df_g["Win Prob"] = df_g["Win Prob"].map(lambda x: f"{x:.1%}")
+        cols = ["Matchup", "Projected Winner", "Win Prob", "Fair Moneyline", "Fair Payout", "Proj Score", "Flags"]
+        st.dataframe(df_g[cols], use_container_width=True, hide_index=True)
 
 
 def render_parlay_tickets(legs, n_legs, max_parlays, is_single_game=False, sport_label="NFL"):
@@ -267,12 +300,12 @@ def get_nba(date_str):
     return ctx
 
 
-@st.cache_resource(show_spinner="Loading Men's CBB 2-year stats & D1 slate...")
+@st.cache_resource(show_spinner="Loading Men's CBB 2-year SOS-adjusted stats & D1 slate...")
 def get_ncaab(date_str):
     return col_sim.build_ncaab_context(date_str)
 
 
-@st.cache_resource(show_spinner="Loading College Football 2-year stats & FBS spreads...")
+@st.cache_resource(show_spinner="Loading College Football 2-year stats & FBS matchups...")
 def get_ncaaf():
     return col_sim.build_ncaaf_context()
 
@@ -294,14 +327,29 @@ if sport_tab == "🏈 NFL":
 
     st.subheader(f"NFL Season {ctx['season']} — Week {ctx['week']}")
     mode = st.tabs([
+        "🏆 Game Winners (Moneyline)",
         "Single Player Prop",
         "Auto Multi-Leg Parlay Builder",
         "2x–3x Value Finder (100/500 Report)",
         "🏈 Anytime Touchdown Finder",
-        "🏆 Pro NFL DFS Optimizer",
+        "Pro NFL DFS Optimizer",
     ])
 
     with mode[0]:
+        st.markdown("### 🏆 NFL Straight-Up Game Winner Projections (1,000,000 Sims / Game)")
+        c1, c2, c3 = st.columns(3)
+        nfl_min_wp = c1.slider("Min Win Probability %", 50, 85, 52, key="nfl_gw_min") / 100.0
+        nfl_gw_tiers = c2.slider("Tiered Games to Show", 2, 16, 6, key="nfl_gw_tiers")
+        nfl_gw_filter = c3.selectbox("Slate Filter", ["Full Week Slate", "🌙 Thursday Night Football Only"], key="nfl_gw_filt")
+
+        if st.button("🚀 Simulate Week's NFL Game Winners", key="run_nfl_gw", type="primary"):
+            g_res = pro_sim.simulate_nfl_games(ctx)
+            if "Thursday" in nfl_gw_filter:
+                g_res = [g for g in g_res if g.get("Is TNF")]
+            g_res = [g for g in g_res if g["Win Prob"] >= nfl_min_wp]
+            render_tiered_game_winners(g_res, max_tiers=nfl_gw_tiers, sport_label="NFL")
+
+    with mode[1]:
         col1, col2, col3, col4 = st.columns(4)
         player_in = col1.text_input("Player Name", value="Josh Allen")
         stat_in = col2.selectbox(
@@ -327,7 +375,7 @@ if sport_tab == "🏈 NFL":
                 c4.metric("Blowout Risk", f"{res['blowout_prob']:.0%}", "Sneaky Blowout!" if res["sneaky_blowout"] else "Normal")
                 st.info(f"**Matchup:** {res['game']} | **Script:** {res['script_note']} | **Flags:** {res['flags']}")
 
-    with mode[1]:
+    with mode[2]:
         st.markdown("### 🎰 Tiered NFL Multi-Leg Parlay & TNF SGP Builder")
         c1, c2, c3, c4, c5 = st.columns(5)
         min_hr = c1.slider("Min Hit Rate % / Leg", 55, 95, 72, key="nfl_hr") / 100.0
@@ -438,7 +486,7 @@ if sport_tab == "🏈 NFL":
                     df_out["consistency"] = df_out["consistency"].map(lambda x: f"{x:.0%}")
                     st.dataframe(df_out, use_container_width=True, hide_index=True)
 
-    with mode[2]:
+    with mode[3]:
         st.markdown("### 💎 Tiered NFL 2x–3x Multiplier Value Finder")
         c1, c2, c3, c4, c5 = st.columns(5)
         p_min = c1.slider("Min Hit Rate %", 20, 45, 30, key="nfl_v1") / 100.0
@@ -515,7 +563,7 @@ if sport_tab == "🏈 NFL":
                             })
             render_tiered_value_plays(rows, max_tiers=nfl_val_tiers, sport_label="NFL")
 
-    with mode[3]:
+    with mode[4]:
         st.markdown("### 🏈 Tiered NFL Anytime Touchdown Scorer Engine (1,000,000 Sims)")
         c1, c2, c3, c4 = st.columns(4)
         min_td_prob = c1.slider("Min Anytime TD %", 15, 70, 32, key="attd_min") / 100.0
@@ -591,7 +639,7 @@ if sport_tab == "🏈 NFL":
                     })
             render_tiered_attd_plays(td_rows, max_tiers=attd_tiers)
 
-    with mode[4]:
+    with mode[5]:
         st.markdown("### 🏆 Pro NFL DFS Lineup Builder (Stacking, Bring-Backs, Leverage & Multi-Lineup)")
         uploaded_csv = st.file_uploader(
             "Upload DraftKings ('DKSalaries.csv') or FanDuel ('FanDuel-NFL.csv') for 100% Exact Slate Prices",
@@ -712,13 +760,25 @@ elif sport_tab == "🏀 NBA":
 
     st.subheader(f"NBA Season {ctx['curr_szn']} — {slate_date} ({len(ctx['todays_games'])} Games)")
     mode = st.tabs([
+        "🏆 Game Winners (Moneyline)",
         "Single Player Prop",
         "Auto Multi-Leg Parlay Builder",
         "2x–3x Value Finder (100/500 Report)",
-        "🏆 NBA DFS Optimizer ($50k)",
+        "NBA DFS Optimizer ($50k)",
     ])
 
     with mode[0]:
+        st.markdown("### 🏆 NBA Straight-Up Game Winner Projections (Pace, B2B Fatigue & Star-Out Adjusted)")
+        c1, c2 = st.columns(2)
+        nba_min_wp = c1.slider("Min Win Probability %", 50, 85, 53, key="nba_gw_min") / 100.0
+        nba_gw_tiers = c2.slider("Tiered Games to Show", 2, 15, 6, key="nba_gw_tiers")
+
+        if st.button("🚀 Simulate Today's NBA Game Winners", key="run_nba_gw", type="primary"):
+            g_res = pro_sim.simulate_nba_games(ctx)
+            g_res = [g for g in g_res if g["Win Prob"] >= nba_min_wp]
+            render_tiered_game_winners(g_res, max_tiers=nba_gw_tiers, sport_label="NBA")
+
+    with mode[1]:
         c1, c2, c3, c4 = st.columns(4)
         player_in = c1.text_input("Player Name", value="Nikola Jokic")
         stat_in = c2.selectbox("Stat", ["PTS", "REB", "AST", "PRA", "PR", "PA", "RA", "FG3M", "STL", "BLK", "DK_PTS"])
@@ -741,7 +801,7 @@ elif sport_tab == "🏀 NBA":
                 c4.metric("Blowout Risk", f"{res['blowout_prob']:.0%}", "Sneaky Blowout!" if res["sneaky_blowout"] else "Normal")
                 st.info(f"**Matchup:** {res['game']} | **Script:** {res['script_note']} | **Flags:** {res['flags']}")
 
-    with mode[1]:
+    with mode[2]:
         st.markdown("### 🎰 Tiered NBA Multi-Leg Parlay Builder")
         c1, c2, c3, c4, c5 = st.columns(5)
         min_hr = c1.slider("Min Hit Rate % / Leg", 55, 95, 75, key="nba_hr") / 100.0
@@ -782,7 +842,7 @@ elif sport_tab == "🏀 NBA":
                     df_out["consistency"] = df_out["consistency"].map(lambda x: f"{x:.0%}")
                     st.dataframe(df_out, use_container_width=True, hide_index=True)
 
-    with mode[2]:
+    with mode[3]:
         st.markdown("### 💎 Tiered NBA 2x–3x Multiplier Value Finder")
         c1, c2, c3, c4 = st.columns(4)
         p_min = c1.slider("Min Hit Rate %", 20, 45, 30, key="nba_v1") / 100.0
@@ -833,7 +893,7 @@ elif sport_tab == "🏀 NBA":
                             })
             render_tiered_value_plays(rows, max_tiers=nba_val_tiers, sport_label="NBA")
 
-    with mode[3]:
+    with mode[4]:
         st.markdown("### 🏆 NBA DFS Lineup Builder (8-Player Roster under $50,000)")
         nba_csv = st.file_uploader(
             "Upload DraftKings ('DKSalaries.csv') or FanDuel NBA CSV for 100% Exact Slate Prices",
@@ -902,21 +962,39 @@ elif sport_tab == "🎓 Men's College Basketball":
     slate_date = st.sidebar.date_input("NCAAB Slate Date", value=datetime.now()).strftime("%Y-%m-%d")
     ctx = get_ncaab(slate_date)
     st.subheader(f"Men's College Basketball — {slate_date} ({len(ctx['todays_games'])} D1 Games)")
+    st.caption("Upgraded with Opponent-Adjusted Efficiency (SOS), Tempo-Adjusted Possessions & Short-Rest/B2B Fatigue")
 
-    if st.button("Simulate All Today's CBB Spreads, Totals & Underdog Upsets (1M Sims/Game)"):
+    c1, c2 = st.columns(2)
+    cbb_min_wp = c1.slider("Min Winner Confidence %", 52, 90, 62, key="cbb_min_wp") / 100.0
+    cbb_tiers = c2.slider("Tiered Winners to Show", 2, 12, 6, key="cbb_tiers")
+
+    if st.button("🚀 Simulate Today's CBB Straight-Up Winners (1M Sims/Game)", type="primary"):
+        winner_cards = []
         rows = []
         tight_dog_rows = []
         for g in ctx["game_list"]:
             res = col_sim.simulate_ncaab_game(g)
+            if res["win_prob"] >= cbb_min_wp:
+                winner_cards.append({
+                    "Matchup": res["game"],
+                    "Projected Winner": res["winner"],
+                    "Win Prob": res["win_prob"],
+                    "Fair Moneyline": res["fair_ml"],
+                    "Fair Payout": res["fair_payout"],
+                    "Proj Score": res["proj_score"],
+                    "Home Win %": f"{res['win_prob']:.1%}" if res["winner"] == res["home"] else f"{1.0 - res['win_prob']:.1%}",
+                    "Away Win %": f"{res['win_prob']:.1%}" if res["winner"] == res["away"] else f"{1.0 - res['win_prob']:.1%}",
+                    "Flags": res["flags"],
+                })
             rows.append({
                 "Matchup": res["game"],
+                "Projected Winner": res["winner"],
+                "Win Prob": f"{res['win_prob']:.1%}",
+                "Fair ML": res["fair_ml"],
                 "Proj Score": res["proj_score"],
                 "Vegas Line": f"{res['home']} {res['spread_line']:+.1f}",
-                "Model Fair Line": f"{res['home']} {res['comp_spread']:+.1f}",
-                "Best Side": res["best_side"],
-                "Cover Prob": f"{res['best_side_prob']:.1%}",
-                "Edge (Pts)": round(res["spread_edge"], 1),
-                "Blowout Risk": f"{res['blowout_prob']:.0%}{' ⚠️' if res['sneaky_blowout'] else ''}",
+                "Best Spread": res["best_side"],
+                "Flags": res["flags"],
             })
             if res["is_tight_dog"]:
                 tight_dog_rows.append({
@@ -925,8 +1003,10 @@ elif sport_tab == "🎓 Men's College Basketball":
                     "Proj Score": res["proj_score"],
                     "Outright Win %": res["dog_win_prob"],
                     "Fair Payout": f"{res['dog_fair_mult']:.2f}x",
-                    "Spread Cover %": f"{res['best_side_prob']:.1%}",
                 })
+
+        winner_cards.sort(key=lambda x: x["Win Prob"], reverse=True)
+        render_tiered_game_winners(winner_cards, max_tiers=cbb_tiers, sport_label="Men's CBB")
 
         if tight_dog_rows:
             st.markdown("### 🐕 Tight-Spread Underdog Outright Win Probabilities (Spread ≤ 3.5)")
@@ -935,11 +1015,8 @@ elif sport_tab == "🎓 Men's College Basketball":
             st.dataframe(df_dogs, use_container_width=True, hide_index=True)
 
         if rows:
-            st.markdown("### 📊 Full D1 Slate Spread & Blowout Projections")
-            df_cbb = pd.DataFrame(rows).sort_values("Edge (Pts)", ascending=False)
-            st.dataframe(df_cbb, use_container_width=True, hide_index=True)
-        else:
-            st.warning("No D1 games found on ESPN scoreboard for this date.")
+            with st.expander("📊 View Full D1 Slate Winner & Spread Board"):
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 # =====================================================================
 #                        COLLEGE FOOTBALL TAB
@@ -948,22 +1025,40 @@ elif sport_tab == "🏟️ College Football":
     ctx = get_ncaaf()
     st.subheader(f"College Football FBS — Season {ctx['curr_szn']} ({len(ctx['upcoming_games'])} Upcoming Games)")
 
-    if st.button("Simulate All Upcoming CFB Spreads & Totals (1M Sims/Game)"):
+    c1, c2 = st.columns(2)
+    cfb_min_wp = c1.slider("Min Winner Confidence %", 50, 90, 58, key="cfb_min_wp") / 100.0
+    cfb_tiers = c2.slider("Tiered Winners to Show", 2, 12, 6, key="cfb_tiers")
+
+    if st.button("🚀 Simulate All Upcoming CFB Winners & Spreads (1M Sims/Game)", type="primary"):
+        winner_cards = []
         rows = []
         for g in ctx["upcoming_games"]:
             res = col_sim.simulate_cfb_game(ctx, g)
+            if res["win_prob"] >= cfb_min_wp:
+                winner_cards.append({
+                    "Matchup": res["game"],
+                    "Projected Winner": res["winner"],
+                    "Win Prob": res["win_prob"],
+                    "Fair Moneyline": res["fair_ml"],
+                    "Fair Payout": res["fair_payout"],
+                    "Proj Score": res["proj_score"],
+                    "Home Win %": f"{res['win_prob']:.1%}" if res["winner"] == res["home"] else f"{1.0 - res['win_prob']:.1%}",
+                    "Away Win %": f"{res['win_prob']:.1%}" if res["winner"] == res["away"] else f"{1.0 - res['win_prob']:.1%}",
+                    "Flags": f"Blowout Risk: {res['blowout_prob']:.0%}",
+                })
             rows.append({
                 "Matchup": res["game"],
+                "Projected Winner": res["winner"],
+                "Win Prob": f"{res['win_prob']:.1%}",
+                "Fair ML": res["fair_ml"],
                 "Proj Score": res["proj_score"],
                 "Vegas Line": f"{res['home']} {res['spread_line']:+.1f}",
-                "Model Fair Line": f"{res['home']} {res['comp_spread']:+.1f}",
                 "Best Side": res["best_side"],
                 "Cover Prob": f"{res['best_side_prob']:.1%}",
-                "Edge (Pts)": round(res["spread_edge"], 1),
-                "Blowout Risk": f"{res['blowout_prob']:.0%}{' ⚠️' if res['sneaky_blowout'] else ''}",
             })
+        winner_cards.sort(key=lambda x: x["Win Prob"], reverse=True)
+        render_tiered_game_winners(winner_cards, max_tiers=cfb_tiers, sport_label="College Football")
+
         if rows:
-            df_cfb = pd.DataFrame(rows).sort_values("Edge (Pts)", ascending=False)
-            st.dataframe(df_cfb, use_container_width=True, hide_index=True)
-        else:
-            st.warning("No upcoming FBS games found on ESPN scoreboard.")
+            with st.expander("📊 View Full FBS Slate Winner & Spread Board"):
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
